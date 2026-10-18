@@ -4,7 +4,21 @@
 
 ### >>> NEW TARGET 2026-10-19: port to Redmi K40 Pro (haydn, SM8350 lahaina) <<<
 
-User confirmed 2026-10-19: K40 Pro bootloader unlocked, TWRP flashed. Agreed roadmap: **M0** device intel + backups (all non-destructive: full /proc/device-tree dump + /sys/firmware/fdt, /proc/partitions + /dev/block/by-name, dmesg, iomem, meminfo, cmdline, getprop, /proc/bus/input/devices, fb0 params, GPT header sda count=34; partition images boot/dtbo/vbmeta/modem/persist/xbl/abl/tz/hyp per slot; dumps land in `dtb/haydn/`, images in `backup/haydn/`, both gitignored) -> **M1** shim on haydn (framebuffer console "hello"; sweet's hardcoded SM7150 constants - FB 0x9c000000, GICD 0x17a00000/GICR 0x17a60000, PSHOLD 0x0c264000, IMEM 0x146aa65c, UFS 0x01d84000 - to be split into a platform layer, SM8350 values from the DT dump) -> **M2** xnu early boot to ramdisk root -> **M3** UFS + iOS rootfs in userdata (destructive; Android deemed expendable in principle, re-confirm with user when reached) -> **M4** GUI + input -> **M5** SMP/USB-net/live-log/battery/display-power parity with sweet -> **M6** configd internet + stability. Reused as-is: xnu patches 0001-0081, tools (mkpayload/mkadt/unpack_bootv2), CI, iOS 16.7 rootfs v15. New unknowns: SM8350 memory map/GIC, X1+A78+A55 topology, A/B slots, UFS 3.1, 120 Hz panel, PM8350 PMIC, touch IC model (from M0 dmesg). Cautions carried over: never `fastboot getvar`, no flashing in M0. Sweet blocker unchanged: 0081 (ue0 link state) committed fdad0de, boot test of 0080s/0081 on v15 pending; sweet work continues in parallel.
+User confirmed 2026-10-19: K40 Pro bootloader unlocked, TWRP flashed. Agreed roadmap: **M0** device intel + backups -> **M1** shim on haydn (framebuffer console) -> **M2** xnu early boot to ramdisk root -> **M3** UFS + iOS rootfs in userdata (destructive; Android deemed expendable in principle, re-confirm with user when reached) -> **M4** GUI + input -> **M5** SMP/USB-net/live-log/battery/display-power parity with sweet -> **M6** configd internet + stability. Reused as-is: xnu patches 0001-0081, tools, CI, iOS 16.7 rootfs v15.
+
+**M0 DONE (2026-10-19).** All dumps+backups pulled over TWRP adb to `backup/haydn/haydn-dump/` (36 files, 1.5 GB: full live DT `haydn.dtb` + text dump `haydn-dt.txt`, dmesg, iomem, partitions, GPT header, gpt.bin, and partition images boot/dtbo/vbmeta/modem/persist/xbl/abl/tz/hyp/xbl_config both slots + devinfo). PC-side copy of the DT also in `dtb/haydn/`. Hardware facts (from live DT + dmesg + cmdline):
+- SoC SM8350 lahaina, 8 GB LPDDR5 (MemTotal 7.47 GB; DT memory: 0x39700000@0x80000000 + 0x1c0000000@0xc0000000). Kernel image loaded at 0xa0080000 (iomem "Kernel code" a0080000-a2a9ffff).
+- CPU: 1xX1+3xA78+4xA55 = 8 cores (rcu_nocbs=0-7). GICv3 **same addresses as sweet**: GICD 0x17a00000, GICR 0x17a60000 stride 0x20000. arch_mem_timer 0x17c21000 (timer@17c20000).
+- **cont_splash_region FB = 0xdfc00000, size 0x2300000** (35 MB). Panel: `qcom,mdss_dsi_k11_38_08_0a_dsc_cmd` (Samsung E4 AMOLED), **1080x2400** (panel-width 0x438, height 0x960), DSC cmd mode, DSI ctrl0/1 @ 0xae94000/0xae96000, MDP @ 0xae00000, display cc @ 0xaf00000.
+- **UFS: 1d84000.ufshc — same base as sweet (0x1d84000)**, PHY 0x1d87000, ICE 0x1d88000; HS-G4 2-lane confirmed in dmesg. androidboot.bootdevice=1d84000.ufshc. userdata = **sda34** (~111 GB, 111316972 1K-blocks); super = sda29; A/B slots, current _a.
+- **USB: a600000.dwc3** (regs 0x0a60c100-0x0a60d93b), hsusb_phy 0x88e3000 (QUSB2-style; NOTE: cmdline says usbcontroller=a600000.dwc3, USB2 high-speed bring-up path same as sweet).
+- IMEM at **0x146bf000** (not sweet's 0x146aa000), restart_reason@0x65c -> **0x146bf65c**. PSHOLD not in DT dump; expect lahaina 0x0c264000 like sweet (verify against Xiaomi lahaina kernel source before use).
+- **Touch: Focaltech fts_ts over SPI** (`a8c000.spi`, spi1.0, "Focaltech V3.2 20200422") + xiaomi-touch layer — NOT sweet's Goodix/GT9896-over-GENI-I2C. New driver work; SPI master at 0xa8c000.
+- Keys: qpnp_pon on **pmk8350@0** PON 0x1300 (SPMI bus c440000.qcom,spmi, core 0xc440000, obsrvr 0xe600000); gpio-keys node exists too. Haptics pm8350b@3.
+- Serial console ttyMSM0 115200 (UART GENI; address in DT, usable for shim debug if needed).
+- dt.tar.gz on the PC copy is the broken 118-byte first attempt — use `haydn.dtb` / `haydn-dt.txt` (fine).
+
+Sweet blocker unchanged: 0081 (ue0 link state) committed fdad0de, boot test of 0080s/0081 on v15 pending; sweet work continues in parallel.
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
