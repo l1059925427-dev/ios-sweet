@@ -2,6 +2,10 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> NEW TARGET 2026-10-19: port to Redmi K40 Pro (haydn, SM8350 lahaina) <<<
+
+User confirmed 2026-10-19: K40 Pro bootloader unlocked, TWRP flashed. Agreed roadmap: **M0** device intel + backups (all non-destructive: full /proc/device-tree dump + /sys/firmware/fdt, /proc/partitions + /dev/block/by-name, dmesg, iomem, meminfo, cmdline, getprop, /proc/bus/input/devices, fb0 params, GPT header sda count=34; partition images boot/dtbo/vbmeta/modem/persist/xbl/abl/tz/hyp per slot; dumps land in `dtb/haydn/`, images in `backup/haydn/`, both gitignored) -> **M1** shim on haydn (framebuffer console "hello"; sweet's hardcoded SM7150 constants - FB 0x9c000000, GICD 0x17a00000/GICR 0x17a60000, PSHOLD 0x0c264000, IMEM 0x146aa65c, UFS 0x01d84000 - to be split into a platform layer, SM8350 values from the DT dump) -> **M2** xnu early boot to ramdisk root -> **M3** UFS + iOS rootfs in userdata (destructive; Android deemed expendable in principle, re-confirm with user when reached) -> **M4** GUI + input -> **M5** SMP/USB-net/live-log/battery/display-power parity with sweet -> **M6** configd internet + stability. Reused as-is: xnu patches 0001-0081, tools (mkpayload/mkadt/unpack_bootv2), CI, iOS 16.7 rootfs v15. New unknowns: SM8350 memory map/GIC, X1+A78+A55 topology, A/B slots, UFS 3.1, 120 Hz panel, PM8350 PMIC, touch IC model (from M0 dmesg). Cautions carried over: never `fastboot getvar`, no flashing in M0. Sweet blocker unchanged: 0081 (ue0 link state) committed fdad0de, boot test of 0080s/0081 on v15 pending; sweet work continues in parallel.
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**
