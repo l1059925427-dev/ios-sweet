@@ -69,9 +69,9 @@
 +	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
 +		return false;
 +	}
-+	if (cpu->phys_id > 0x500 || (cpu->phys_id & 0xff) != 0 ||
++	if (cpu->phys_id > 0x103 ||
 +	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
-+		panic("SWEET CPU: invalid A55 topology cpu=%u mpidr=0x%x count=%u",
++		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
 +		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
  	}
  	if (!IOCPU::start(provider)) {
@@ -105,7 +105,7 @@
 +	const ml_topology_info_t *topology = ml_get_topology_info();
 +	uint32_t requested = 1;
 +	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
-+	IOLog("SWEET CPU: requested=%u selected=%u (A55 limit=%u)\n",
++	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
 +	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
 +
 +	uint64_t deadline;
@@ -121,7 +121,8 @@
 +		}
 +		IOSleep(1);
 +	}
-+	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
++	/* Boot CPU must be cpu_id=0 and phys_id=0 (both sweet synthetic and
++	 * haydn real MPIDR 0x000). All other cores are brought up here. */
 +	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
 +		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
 +	}

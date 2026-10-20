@@ -22,12 +22,14 @@
  	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
  		return false;
  	}
--	if (cpu->phys_id > 0x500 || (cpu->phys_id & 0xff) != 0 ||
-+	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
-+	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	/* SM8350 (haydn): 0x000-0x003 gold (A78), 0x100-0x103 silver (A55).
++	 * sweet (SM7150): synthetic MPIDR with Aff1=core, Aff0 always 0.
++	 * Accept any unique phys_id up to 0x103; do NOT require Aff0==0. */
++	if (cpu->phys_id > 0x103 ||
  	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
--		panic("SWEET CPU: invalid A55 topology cpu=%u mpidr=0x%x count=%u",
-+		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
  		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
  	}
  	if (!IOCPU::start(provider)) {

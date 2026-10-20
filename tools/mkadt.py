@@ -2,7 +2,7 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--haydn]
 """
 import hashlib, os, struct, sys
 
@@ -32,6 +32,21 @@ VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
+
+# --haydn (Redmi K40 Pro, SM8350 lahaina; facts from the M0 live DT dump):
+# bank 2 of DRAM is 0xc0000000-0x180000000 with every reserved-memory carve-out
+# below 0xe2400000 -> kernel RAM at 4 GB. Device has 8 GB (iomem: main bank
+# 0xddc00000-0x27fffffff, ~6 GB free above 4 GB), so give the kernel the same
+# 4.03 GB the proven sweet-0069hi layout used: identical heap size/geometry.
+# (1 GB made the first UFS-root boot panic in pmap_switch_internal with a
+# corrupted pmap_cpu_data pointer; sweet with 4 GB never corrupted.)
+HAYDN_PHYS_BASE = 0x100000000
+HAYDN_MEM_SIZE = 0xfcc00000
+HAYDN_FB, HAYDN_FB_SIZE = 0xdfc00000, 0x2300000
+HAYDN_VTIMER_INTID = 27
+# SM8350 real layout: 4xA78 gold (0-3) + 4xA55 silver (4-7)
+# Max OPP frequencies per cluster (descriptive for xnu)
+HAYDN_FREQS = (2841600000, 1804800000)  # gold, silver
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -68,10 +83,18 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, haydn=False, add_fbcon=True):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    fb, fb_size, vtimer = FB, FB_SIZE, VTIMER_INTID
+    # sweet: cores 0-5 A55 @1.8G, 6-7 A76 @2.3G
+    freq_of = (lambda c: 2304000000 if c >= 6 else 1804800000)
+    if haydn:
+        phys_base, mem_size = HAYDN_PHYS_BASE, HAYDN_MEM_SIZE
+        fb, fb_size, vtimer = HAYDN_FB, HAYDN_FB_SIZE, HAYDN_VTIMER_INTID
+        # SM8350 real: 0-3 A78 gold @2.84G, 4-7 A55 silver @1.8G
+        freq_of = lambda c: HAYDN_FREQS[0 if c < 4 else 1]
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -119,32 +142,62 @@ def build(seed=None, qemu=False, highmem=False):
         # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
         node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))])])
 
-    # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
-    # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
-    # and uses cpus=N to select an initial prefix (N <= 8).
+    # SWEET SMP: eight cores.
+    #   sweet (SM7150): 0-5 Cortex-A55 @1.8G, 6-7 Cortex-A76 @2.3G, one
+    #   homogeneous cluster, reg = core << 8 (synthetic MPIDR with Aff1=core).
+    #   haydn (SM8350): 0-3 A78 gold, 4-7 A55 silver (two physical clusters!).
+    #   Real Qualcomm MPIDR layout = Aff1 encodes cluster, Aff0 encodes core
+    #   within cluster: gold 0x000..0x003, silver 0x100..0x103.
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
-    for core in range(1 if qemu else 8):
-        cpu_nodes.append(node(f'cpu{core}', [
-            ph(),
-            ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
-            ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
-            ('die-cluster-id', u32(0)),
-            ('cluster-core-id', u32(core)),
-            ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
-            ('l3-cache-id', u32(0)),     # shared L3
-            ('state', cstr('running' if core == 0 else 'stopped')),
-            ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
-            ('bus-frequency', u32(100000000)),
-            ('memory-frequency', u32(1866000000)),
-            ('peripheral-frequency', u32(timebase)),
-            ('fixed-frequency', u32(timebase)),
-        ]))
+    if haydn:
+        haydn_regs = [0x000, 0x001, 0x002, 0x003,  # gold
+                      0x100, 0x101, 0x102, 0x103]  # silver
+        haydn_die_clusters = [0, 0, 0, 0, 1, 1, 1, 1]   # gold=0, silver=1
+        haydn_cluster_core_ids = [0, 1, 2, 3, 0, 1, 2, 3]  # Aff0 within cluster
+        for core in range(8):
+            cpu_nodes.append(node(f'cpu{core}', [
+                ph(),
+                ('device_type', cstr('cpu')),
+                ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+                ('reg', u32(haydn_regs[core])),  # real SM8350 MPIDR Aff1:Aff0
+                ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
+                ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
+                ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+                ('die-cluster-id', u32(haydn_die_clusters[core])),
+                ('cluster-core-id', u32(haydn_cluster_core_ids[core])),
+                ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
+                ('l3-cache-id', u32(0)),     # shared L3
+                ('state', cstr('running' if core == 0 else 'stopped')),
+                ('timebase-frequency', u32(timebase)),
+                ('clock-frequency', u32(freq_of(core))),
+                ('bus-frequency', u32(100000000)),
+                ('memory-frequency', u32(1866000000)),
+                ('peripheral-frequency', u32(timebase)),
+                ('fixed-frequency', u32(timebase)),
+            ]))
+    else:
+        for core in range(1 if qemu else 8):
+            cpu_nodes.append(node(f'cpu{core}', [
+                ph(),
+                ('device_type', cstr('cpu')),
+                ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+                ('reg', u32(core << 8)),  # synthetic MPIDR with Aff1 = core
+                ('cpu-id', u32(core)),
+                ('cluster-id', u32(0)),
+                ('cluster-type', u32(0)),
+                ('die-cluster-id', u32(0)),
+                ('cluster-core-id', u32(core)),
+                ('l2-cache-id', u32(core)),
+                ('l3-cache-id', u32(0)),
+                ('state', cstr('running' if core == 0 else 'stopped')),
+                ('timebase-frequency', u32(timebase)),
+                ('clock-frequency', u32(freq_of(core))),
+                ('bus-frequency', u32(100000000)),
+                ('memory-frequency', u32(1866000000)),
+                ('peripheral-frequency', u32(timebase)),
+                ('fixed-frequency', u32(timebase)),
+            ]))
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
@@ -152,7 +205,7 @@ def build(seed=None, qemu=False, highmem=False):
         ph(),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
-        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else vtimer)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
     arm_io = node('arm-io', [
@@ -181,7 +234,7 @@ def build(seed=None, qemu=False, highmem=False):
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
+        ('reg', u64(fb, fb_size)),
         ('width', u32(FB_W)),
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
@@ -224,11 +277,14 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, buttons]
+       + ([fbcon] if add_fbcon else [])
+       + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 haydn='--haydn' in sys.argv, add_fbcon='--nofbcon' not in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
