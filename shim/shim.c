@@ -7,17 +7,17 @@
  * Any unexpected exception paints a blue panic screen.
  */
 #include <stdint.h>
+#include "platform.h"
 #include "console.h"
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
+/* Platform addresses come from platform.h: IMEM_RESTART_REASON,
+ * PLATFORM_PSHOLD (sweet only), GICD_BASE, GICR_BASE, UFS_BASE, NR_CPUS,
+ * VTIMER_INTID, PTIMER_INTID. */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
 
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -30,8 +30,6 @@
 #define GICR_ISPENDR0		(GICR_SGI + 0x200)
 #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
 #define GICR_ICFGR1		(GICR_SGI + 0xc04)
-#define VTIMER_INTID		19	/* DT: <GIC_PPI 3 ...>, not the usual 27 */
-#define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
 #define SGI_INTID		1
 
 #define PSCI_VERSION		0x84000000UL
@@ -44,8 +42,6 @@
 #define PSCI_SYSTEM_SUSPEND	0xc400000eUL
 #define PSCI_SYSTEM_RESET2	0xc4000012UL
 #define SMCCC_VERSION		0x80000000UL
-
-#define NR_CPUS			8
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
@@ -109,7 +105,9 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-	wr32(PSHOLD, 0);
+#ifdef PLATFORM_PSHOLD
+	wr32(PLATFORM_PSHOLD, 0);
+#endif
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -376,8 +374,8 @@ void shim_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
-	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_clear(GREEN);
+	con_str("SHIM", PLATFORM_NAME " milestone 4B: A-revert+patchB");
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
@@ -405,7 +403,7 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
-	con_str("SHIM", "sweet milestone 3");
+	con_str("SHIM", PLATFORM_NAME " milestone 3");
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);
@@ -417,7 +415,7 @@ void shim_main(uint64_t dtb)
 	con_hex2("PARANGE", "mmfr0=", rsr("id_aa64mmfr0_el1") & 0xf, "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
 	con_skip();
 	con_hex("PAR img", mmu_probe((uintptr_t)shim_main));
-	con_hex("PAR fb", mmu_probe(FB_PHYS + 0x1000));
+	con_hex("PAR fb", mmu_probe(FB_BASE + 0x1000));
 	con_hex("PAR gic", mmu_probe(GICD_BASE));
 	con_hex("PAR 12G", mmu_probe(0x300000000UL));
 	con_skip();

@@ -76,18 +76,42 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+extern char _end[];
+
 const char *loader_boot(uintptr_t dtb)
 {
-	uint64_t rd_start, rd_end;
+	uint64_t rd_start = 0, rd_end = 0;
+
+	/* Preferred: payload appended to our own kernel image (MIUI ABL v3 does
+	 * not deliver the boot ramdisk to RAM where its FDT claims). */
+	const struct payload *p = (const struct payload *)(((uintptr_t)_end + 7) & ~7UL);
+	if (magic_ok(p->magic)) {
+		con_hex("PAYLOAD@", (uintptr_t)p);
+		goto found;
+	}
 
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 
-	const struct payload *p = (const struct payload *)rd_start;
-	if (!magic_ok(p->magic))
+	p = (const struct payload *)rd_start;
+	if (!magic_ok(p->magic)) {
+		volatile uint32_t *w = (volatile uint32_t *)rd_start;
+		con_hex2("MAGIC?", "w0=", w[0], "w1=", w[1]);
+		con_hex2("MAGIC?", "w2=", w[2], "w3=", w[3]);
+		/* Hunt for the magic anywhere near the FDT-declared initrd. */
+		uint64_t lo = rd_start > 64 * 1024 * 1024 ? rd_start - 64 * 1024 * 1024 : 0;
+		uint64_t hi = rd_end + 64 * 1024 * 1024;
+		for (uint64_t a = lo; a < hi; a += 8)
+			if (magic_ok((const char *)a)) {
+				con_hex2("FOUND@", "off=", a - rd_start, "at=", a);
+				p = (const struct payload *)a;
+				goto found;
+			}
 		return "no SWEETXNU payload";
+	}
+found:
 	if (p->version != 1 || (p->adt_off & 7) || (rd_start & 7))
 		return "bad payload header";
 
@@ -103,15 +127,29 @@ const char *loader_boot(uintptr_t dtb)
 	for (uint32_t i = 0; i < p->nsegs; i++) {
 		const struct payload_seg *s = &p->segs[i];
 		uintptr_t dst = s->vmaddr + pa_of_va_base;
-		copy64(dst, rd_start + s->file_off, s->file_size);
+		copy64(dst, (uintptr_t)p + s->file_off, s->file_size);
 		if (s->vmsize > s->file_size)
 			zero64(dst + ((s->file_size + 7) & ~7UL), s->vmsize - ((s->file_size + 7) & ~7UL));
 	}
 	con_hex2("SEGS", "n=", p->nsegs, "end=", p->kernel_end + pa_of_va_base);
 
+	/* In-RAM payload integrity: sum of all u64s over the payload span. */
+	uint64_t span = p->adt_off + p->adt_size;
+	for (uint32_t i = 0; i < p->nsegs; i++)
+		if (p->segs[i].file_off + p->segs[i].file_size > span)
+			span = p->segs[i].file_off + p->segs[i].file_size;
+	uint64_t sum = 0;
+	for (uint64_t o = 0; o + 8 <= span; o += 8)
+		sum += *(volatile uint64_t *)((uintptr_t)p + o);
+	con_hex2("SUM", "span=", span, "sum=", sum);
+
+	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
+	volatile uint32_t *ew = (volatile uint32_t *)entry_pa;
+	con_hex2("ENTRYW", "w0=", ew[0], "w1=", ew[1]);
+
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
-	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	copy64(adt_pa, (uintptr_t)p + p->adt_off, p->adt_size);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 
@@ -136,7 +174,6 @@ const char *loader_boot(uintptr_t dtb)
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
-	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
 

@@ -1,5 +1,8 @@
 # device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
 backup/
+# Apple IPSW and rootfs build artifacts
+*.ipsw
+ipsw-work/
 dtb/
 recovery/
 # third-party/Apple sources fetched for reading

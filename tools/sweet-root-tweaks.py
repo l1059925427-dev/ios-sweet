@@ -64,11 +64,14 @@ def launchd(root):
         if '_PanicOnCrash' in job:
             job['_PanicOnCrasX'] = job.pop('_PanicOnCrash')
             renamed += 1
-    removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
+    drop = {'com.apple.CommCenter',    # no baseband: crash-loops, Setup blocks on its XPC
+            'com.apple.bluetoothd',    # no BT transport: crash-loops (haydn boot-10)
+            'com.apple.fairplayd.H2'}  # no FairPlay/SEP: crash-loops (haydn boot-10)
+    removed = [k for k, j in jobs.items() if j.get('Label') in drop]
     for k in removed:
         del jobs[k]
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
-    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
+    print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} jobs removed: {sorted(drop)}')
 
 
 def containers(root):
