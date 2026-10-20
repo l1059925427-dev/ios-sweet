@@ -1,0 +1,64 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -148,25 +148,36 @@
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
++	unsigned int nalive = 0;
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		if (kr != KERN_SUCCESS) {
+-			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
++			/* MIUI PSCI rejects some secondaries outright (rc=-1/-8).
++			 * Boot best-effort with the cores that do come up. */
++			IOLog("SWEET CPU: cpu=%u skipped: processor_start failed: %d\n",
++			    i, kr);
++			continue;
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
++		boolean_t alive = true;
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
++				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive (skipped)\n",
+ 				    i, topology->cpus[i].phys_id);
+-				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++				alive = false;
++				break;
+ 			}
+ 			IOSleep(1);
+ 		}
++		if (!alive) {
++			continue;
++		}
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
++		nalive++;
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+@@ -174,7 +185,7 @@
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+-	    topology->num_cpus, topology->num_cpus);
++	    nalive, topology->num_cpus);
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -244,9 +255,10 @@
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+ 	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+-	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
+-		panic("SWEET CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
++		/* e.g. PSCI_DENIED/DISABLED for MIUI-parked cores. Report failure so
++		 * startAll() skips this core instead of hanging the boot. */
++		return KERN_NOT_SUPPORTED;
+ 	}
+ 	return KERN_SUCCESS;
+ }
