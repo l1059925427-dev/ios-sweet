@@ -1,0 +1,29 @@
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -946,6 +946,26 @@
+ 			(void) ml_set_interrupts_enabled(interrupt_state);
+ 			return;
+ 		} else {
++#if defined(SWEET)
++			/*
++			 * sweet: implementation-defined op1=3 system registers
++			 * (Apple's private PMU/cluster block, and CNTP_CTL_EL0
++			 * which SM8350 firmware UNDEFs at EL1) raise Uncategorized
++			 * exceptions on Qualcomm cores. Skip them like the proven
++			 * binary NOP sweep: MRS reads return 0, MSR writes are
++			 * dropped. Every other kernel undefined still panics.
++			 */
++			if (((instr >> 16) & 0x1f) == 27 &&
++			    ((instr & 0xfff00000) == 0xd5300000 ||
++			     (instr & 0xfff00000) == 0xd5100000)) {
++				if ((instr & 0xfff00000) == 0xd5300000 &&
++				    (instr & 0x1f) < 31) {
++					set_saved_state_reg(state, instr & 0x1f, 0);
++				}
++				set_saved_state_pc(state, get_saved_state_pc(state) + 4);
++				return;
++			}
++#endif
+ 			panic("Undefined kernel instruction: pc=%p instr=%x", (void*)get_saved_state_pc(state), instr);
+ 		}
+ 	}
