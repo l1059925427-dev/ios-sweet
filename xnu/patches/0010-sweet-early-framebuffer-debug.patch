@@ -116,7 +116,7 @@ index ccbb188..777aca4 100644
  	// Set low reset vector before attempting any loads
  	adrp	x0, EXT(LowExceptionVectorBase)@page
  	add		x0, x0, EXT(LowExceptionVectorBase)@pageoff
-@@ -609,6 +628,23 @@ Lkernelcache_base_found:
+@@ -609,6 +628,34 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -134,6 +134,17 @@ index ccbb188..777aca4 100644
 +	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
 +	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
 +	add		x13, x25, #(2 * PGBYTES)
++	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	/* The splash FB can straddle a 32MB L2 block boundary (haydn FB
++	 * 0xdfc00000 sits 0x1c00000 into L2[111]); map the next block too.
++	 * Block TTEs keep only the block-aligned output address, so
++	 * TTE+0x2000000 at index+1 stays an identity map (on sweet it
++	 * harmlessly NC-maps the next 32MB of RAM in this throwaway table). */
++	add		x11, x11, #0x800, lsl #12
++	add		x11, x11, #0x800, lsl #12
++	add		x11, x11, #0x800, lsl #12
++	add		x11, x11, #0x800, lsl #12
++	add		x12, x12, #1
 +	str		x11, [x13, x12, lsl #TTE_SHIFT]
 +#endif
 +
