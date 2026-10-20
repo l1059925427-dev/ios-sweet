@@ -18,7 +18,7 @@
  #define __ARM_ARCH__              8
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -73,9 +73,10 @@
+@@ -73,10 +73,12 @@
  	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
  		return false;
  	}
@@ -53,3 +53,4 @@
  	if (!cpus_boot_arg_present || cpu_boot_arg == 0) {
  		cpu_boot_arg = 1;
  	}
+ 
