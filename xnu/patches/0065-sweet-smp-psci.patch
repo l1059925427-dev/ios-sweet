@@ -76,7 +76,7 @@
  	}
  	if (!IOCPU::start(provider)) {
  		return false;
-@@ -77,21 +106,75 @@
+@@ -77,21 +106,76 @@
  		panic("SWEET CPU: PMI routing is not implemented");
  	}
  
@@ -414,3 +414,4 @@
  #define ARM_ARCH_TIMER
  #define __ARM_ARCH__              8
  #define __ARM_VMSA__              8
+ 
