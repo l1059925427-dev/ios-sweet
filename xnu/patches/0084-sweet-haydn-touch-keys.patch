@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..48937d8
 --- /dev/null
 +++ b/bsd/dev/sweet_keys_haydn.c
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,188 @@
 +/*
 + * SWEET haydn (SM8350) polled keys: PMIC PON power/vol-down + TLMM vol-up.
 + *
@@ -59,7 +59,6 @@ index 0000000..48937d8
 +/* TLMM gpio 6 (volume up, active low). */
 +#define HK_TLMM_PA      0x0f000000u
 +#define HK_GPIO_VOLUP   6u
-+#define HK_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
 +#define HK_GPIO_IO(n)   ((uint32_t)(n) * 0x1000u + 4u)
 +
 +static vm_offset_t hk_core, hk_obs, hk_cnfg, hk_gpio;
@@ -182,11 +181,6 @@ index 0000000..48937d8
 +		printf("SWEET HKEYS: MMIO mapping failed\n");
 +		return;
 +	}
-+	/* vol_up: Android pinctrl key_vol_up_default = func "norm", input-enable,
-+	 * bias-pull-up (TLMM GPIO_CFG: PULL=up(3), FUNC=0, OE=0). The ABL may
-+	 * leave the pin unconfigured, so program it ourselves. */
-+	*(volatile uint32_t *)(hk_gpio + HK_GPIO_CFG(HK_GPIO_VOLUP)) = 3u;
-+	__asm__ volatile("dsb osh" ::: "memory");
 +	hk_version = hk_rd(hk_core, 0);
 +	uint32_t count = hk_rd(hk_core, 4) & 0x7ffu;
 +	if (hk_version < 0x50000000u || hk_version >= 0x70000000u ||
