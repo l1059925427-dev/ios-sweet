@@ -723,7 +723,9 @@ index 0000000..fb04ce3
 +			if ((errors++ % 100u) == 0) {
 +				printf("SWEET HTOUCH: poll err=%d irq=%#x\n", err, ht.irq_status);
 +			}
-+			if (errors == 10) {
++			if (errors == 100) {
++				/* ~1 s without data: the finger is really gone. Releasing
++				 * after 10 frames made the home bar jump and snap back. */
 +				ht_report(0, ht.x, ht.y);
 +			}
 +		} else {
