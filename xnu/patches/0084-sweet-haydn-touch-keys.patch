@@ -1,0 +1,783 @@
+Index: bsd/conf/files
+===================================================================
+--- bsd/conf/files
++++ bsd/conf/files
+@@ -106,6 +106,8 @@
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
++bsd/dev/sweet_touch_haydn.c		standard
++bsd/dev/sweet_keys_haydn.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+
+Index: bsd/dev/sweet_ufs.c
+===================================================================
+--- bsd/dev/sweet_ufs.c
++++ bsd/dev/sweet_ufs.c
+@@ -47,6 +47,8 @@
+ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
++extern void sweet_touch_haydn_init(void);
++extern void sweet_keys_haydn_init(void);
+
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -599,6 +601,9 @@
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	/* haydn input drivers (Focaltech FTS over GENI SPI + PMIC PON keys). */
++	sweet_touch_haydn_init();
++	sweet_keys_haydn_init();
+ 	return 0;
+ }
+
+Index: bsd/dev/sweet_touch_haydn.c
+===================================================================
+--- /dev/null
++++ bsd/dev/sweet_touch_haydn.c
+@@ -0,0 +1,540 @@
++/*
++ * SWEET haydn (SM8350) Focaltech FTS touch over GENI SPI.
++ *
++ * Hardware (from the live Android DT dump):
++ *   - GENI SE: spi@a8c000 (QUPv3_1 SE11), wrapper 0xac0000
++ *   - IC: focaltech@0 chip-id 0x5652, SPI MODE_0, MSB first, 8-bit words
++ *   - vdd: touch_avdd_vreg (regulator-fixed, always on)
++ *   - vcc_i2c: pm8350c_l2 (RPMh VRM LDO "ldoc2", 1.8 V; needs an RPMh vote)
++ *   - reset GPIO 330 (active low), irq GPIO 331 (falling edge)
++ *   - TLMM pinctrl@f000000 (lahaina)
++ *   - report block: read 63 bytes from register 0x01 (new SPI protocol)
++ *
++ * FTS new SPI protocol (Xiaomi haydn-r-oss focaltech_spi.c):
++ *   read: TX [addr][0x80][0][len][3 dummy][...]; RX byte3 = status
++ *         (ok when (b & 0xA0) == 0), payload from byte 7. 0x80 = read, no CRC.
++ *   CS stays low for the whole frame; >=150us high between frames (GENI CS is
++ *   automatic when SE_SPI_TRANS_CFG CS_TOGGLE is clear; inter-frame gap comes
++ *   from our 10ms poll loop).
++ *
++ * GENI SPI model (Linux spi-geni-qcom.c / geni-se.h, master FIFO mode):
++ *   - M_CMD opcode = SPI_TX_ONLY|SPI_RX_ONLY = 3 (full duplex), params = 0
++ *   - SE_SPI_TX_TRANS_LEN (0x26c) and SE_SPI_RX_TRANS_LEN (0x270) written
++ *     BEFORE the command, in SPI words (== bytes for 8-bit words)
++ *   - CS automatic: clear CS_TOGGLE in SE_SPI_TRANS_CFG (0x25c)
++ *   - MODE_0: SE_SPI_CPHA (0x224) = 0, SE_SPI_CPOL (0x230) = 0
++ *   - word len: SE_SPI_WORD_LEN (0x268) = (bits - 4) = 4 for 8-bit
++ *   - packing: MSB-first via SE_GENI_TX/RX_PACKING (0x260/0x264/0x284/0x288),
++ *     SE_GENI_BYTE_GRAN (0x254); 4 bytes per 32-bit FIFO word
++ *   - clock: SE_MCLK (0x48) = (div << 4) | 1, SE_CLK_SEL (0x7c) = clk src
++ *
++ * Call once after the scheduler is running; all work runs on one thread.
++ * RPMh vote for ldoc2 uses sweet_rpmh.c. No firmware upload, no config
++ * download. Polling thread like the sweet GT9896 driver.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <libkern/libkern.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++void sweet_touch_haydn_init(void);
++
++/* Platform constants (lahaina/SM8350). */
++#define HT_SE_PA        0x00a8c000u  /* QUPv3_1 SE11 spi@a8c000 */
++#define HT_GCC_PA       0x00100000u  /* qcom,gcc@100000 */
++#define HT_TLMM_PA      0x0f000000u  /* pinctrl@f000000 */
++#define HT_SE_SIZE      0x4000u
++#define HT_GPIO_RESET   330u
++#define HT_GPIO_IRQ     331u
++#define HT_GPIO_CFG(n)  ((uint32_t)(n) * 0x1000u)
++#define HT_GPIO_IO(n)   (HT_GPIO_CFG(n) + 4u)
++#define HT_MAX          10u
++
++/* GCC: QUPv3_1 wrapper + SE11 se_clk. Offsets are the lahaina GCC layout;
++ * the RCG index for WRAP1 S11. DT clocks were <gcc 0x6a, gcc 0x80, gcc 0x81>
++ * (se_clk, m_ahb, s_ahb). Vote mask preserved from the sweet wrapper1 scheme;
++ * branch-halt checks confirm the clock is actually running. */
++#define HT_GCC_VOTE     0x5200cu
++#define HT_RCG          0x18230u     /* QUPV3_WRAP1_S11 se_clk RCG (lahaina) */
++
++/* GENI SE generic registers (same IP family as sweet). */
++#define SE_FORCE_DEFAULT 0x020u
++#define GENI_OUTPUT_CTRL 0x024u
++#define SE_CGC_CTRL     0x028u
++#define SE_STATUS       0x040u
++#define SE_MCLK         0x048u
++#define SE_FW           0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_IRQ_EN_LEGACY 0x0e1cu    /* note: SE IRQ enable is 0xe1c per geni_se_init */
++#define SE_DMA          0x258u
++#define SE_TX_LEN       0x26cu      /* == SE_SPI_TX_TRANS_LEN */
++#define SE_RX_LEN       0x270u      /* == SE_SPI_RX_TRANS_LEN */
++#define SE_CMD          0x600u      /* SE_GENI_M_CMD0 */
++#define SE_CTRL         0x604u
++#define SE_IRQ          0x610u
++#define SE_IRQ_EN       0x614u
++#define SE_IRQ_CLR      0x618u
++#define SE_TX           0x700u
++#define SE_RX           0x780u
++#define SE_TX_COUNT     0x800u
++#define SE_RX_COUNT     0x804u
++#define SE_HW_TX        0xe24u
++#define SE_HW_RX        0xe28u
++
++/* GENI SPI-specific registers. */
++#define SE_SPI_CPHA     0x224u
++#define SE_SPI_LOOPBACK 0x22cu
++#define SE_SPI_CPOL     0x230u
++#define SE_SPI_DEMUX_INV 0x24cu     /* CS polarity: BIT(cs)=active-high */
++#define SE_SPI_DEMUX_SEL 0x250u     /* which CS */
++#define SE_BYTE_GRAN    0x254u
++#define SE_TX_PACK0     0x260u
++#define SE_TX_PACK1     0x264u
++#define SE_SPI_TRANS_CFG 0x25cu     /* CS_TOGGLE = BIT(1) */
++#define SE_SPI_WORD_LEN 0x268u
++#define SE_RX_PACK0     0x284u
++#define SE_RX_PACK1     0x288u
++#define SE_DMA_GENERAL  0xe30u
++#define SE_TX_WM        0x80cu
++
++#define SE_DONE         (1u << 0)
++#define SE_RX_WM        (1u << 26)
++#define SE_RX_LAST      (1u << 27)
++#define SE_TX_WM_EVENT  (1u << 30)
++#define SE_ERRORS       (0x0eu | (1u << 9) | (1u << 10) | (1u << 12) | \
++                         (1u << 13) | (3u << 24) | (3u << 28))
++#define SE_EVENTS       (SE_DONE | SE_ERRORS | (1u << 5) | SE_RX_WM | \
++                         SE_RX_LAST | SE_TX_WM_EVENT)
++
++#define SPI_M_CMD_FULLDUPLEX 3u     /* SPI_TX_ONLY(1) | SPI_RX_ONLY(2) */
++
++/* FTS new-SPI command bytes. */
++#define FTS_CMD_READ_NC 0x80u       /* read, no CRC */
++#define FTS_REG_CHIP_ID 0xA3u
++#define FTS_REG_CHIP_ID2 0x9Fu
++#define FTS_REG_TOUCH   0x01u
++#define FTS_TOUCH_LEN   63u
++
++static struct {
++	vm_offset_t se, gcc, gpio;
++	bool started, dead;
++	uint32_t irq_status, active;
++	int x[HT_MAX], y[HT_MAX];
++} ht;
++static int ht_sleep_chan;
++
++static uint32_t
++ht_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++ht_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++ht_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ht_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++ht_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(ht_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++ht_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out)
++{
++	uint32_t off = HT_GPIO_CFG(pin);
++	uint32_t cfg = ht_rd(ht.gpio, off);
++	if (out) {
++		ht_wr(ht.gpio, HT_GPIO_IO(pin),
++		    ht_rd(ht.gpio, HT_GPIO_IO(pin)) | 2u);
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
++	ht_wr(ht.gpio, off, cfg);
++}
++
++static bool
++ht_clocks(void)
++{
++	uint32_t mask = (0x0fu << 18) | (1u << 23);
++	ht_wr(ht.gcc, HT_GCC_VOTE, ht_rd(ht.gcc, HT_GCC_VOTE) | mask);
++	uint32_t cfg = ht_rd(ht.gcc, HT_RCG + 4u);
++	uint32_t dfs = ht_rd(ht.gcc, HT_RCG + 0x14u);
++	printf("SWEET HTOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    ht_rd(ht.gcc, HT_GCC_VOTE), ht_rd(ht.gcc, HT_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		cfg = ht_rd(ht.gcc, HT_RCG + 0x1cu);
++		if ((cfg & 0x371fu) != 1u) {
++			printf("SWEET HTOUCH: DFS level0=%#x is not XO/1\n", cfg);
++			return false;
++		}
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		ht_wr(ht.gcc, HT_RCG + 4u, cfg);
++		ht_wr(ht.gcc, HT_RCG, ht_rd(ht.gcc, HT_RCG) | 1u);
++		if (!ht_wait_clear(ht.gcc, HT_RCG, 1u)) {
++			printf("SWEET HTOUCH: RCG update timeout\n");
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++ht_abort(void)
++{
++	ht_wr(ht.se, SE_CTRL, 2);
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (ht_rd(ht.se, SE_IRQ) & (1u << 5)) {
++			break;
++		}
++		delay(1);
++	}
++	(void)ht_wait_clear(ht.se, SE_STATUS, 1u);
++	for (unsigned i = 0; i < 64 && (ht_rd(ht.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
++		(void)ht_rd(ht.se, SE_RX);
++	}
++	ht_wr(ht.se, SE_IRQ_CLR, 0xffffffffu);
++}
++
++/* One full-duplex SPI frame of n words (bytes at 8-bit word length). TX and
++ * RX advance together; the caller supplies the TX stream and reads back the
++ * same number of RX bytes (leading dummy bytes included). */
++static int
++ht_spi_frame(const uint8_t *tx, unsigned n, uint8_t *rx)
++{
++	if (ht.dead || !n) {
++		return EIO;
++	}
++	if (!ht_wait_clear(ht.se, SE_STATUS, 1u)) {
++		ht.dead = true;
++		return EBUSY;
++	}
++	ht_wr(ht.se, SE_IRQ_CLR, 0xffffffffu);
++	ht_wr(ht.se, SE_TX_LEN, n);
++	ht_wr(ht.se, SE_RX_LEN, n);
++	ht_wr(ht.se, SE_CMD, (SPI_M_CMD_FULLDUPLEX << 27));
++	unsigned sent = 0, got = 0;
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 40000; ++i) {
++		uint32_t irq = ht_rd(ht.se, SE_IRQ);
++		ht.irq_status = irq;
++		if (irq & SE_ERRORS) {
++			err = EIO;
++			break;
++		}
++		while (sent < n && (irq & SE_TX_WM_EVENT)) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < 4 && sent < n; ++j) {
++				word |= (uint32_t)tx[sent++] << (8u * j);
++			}
++			ht_wr(ht.se, SE_TX, word);
++			irq = ht_rd(ht.se, SE_IRQ);
++		}
++		uint32_t count = ht_rd(ht.se, SE_RX_COUNT) & 0x1ffffffu;
++		while (count-- && got < n) {
++			uint32_t word = ht_rd(ht.se, SE_RX);
++			for (unsigned j = 0; j < 4 && got < n; ++j) {
++				rx[got++] = (uint8_t)(word >> (8u * j));
++			}
++		}
++		if (irq & SE_DONE) {
++			ht_wr(ht.se, SE_IRQ_CLR, irq);
++			if (sent == n) {
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		ht_wr(ht.se, SE_IRQ_CLR, irq & (SE_RX_WM | SE_RX_LAST | SE_TX_WM_EVENT));
++		delay(1);
++	}
++	ht_abort();
++	return err;
++}
++
++static int
++ht_fts_read(uint8_t addr, uint8_t *buf, unsigned len)
++{
++	uint8_t tx[4 + 3 + FTS_TOUCH_LEN] = {0};
++	uint8_t rx[4 + 3 + FTS_TOUCH_LEN] = {0};
++	unsigned total = 4 + 3 + len;
++	tx[0] = addr;
++	tx[1] = FTS_CMD_READ_NC;
++	tx[2] = 0;
++	tx[3] = (uint8_t)len;
++	int err = ht_spi_frame(tx, total, rx);
++	if (err) {
++		return err;
++	}
++	if ((rx[3] & 0xA0u) != 0) {
++		printf("SWEET HTOUCH: fts status %#x on reg %#x\n", rx[3], addr);
++		return EIO;
++	}
++	for (unsigned i = 0; i < len; ++i) {
++		buf[i] = rx[7 + i];
++	}
++	return 0;
++}
++
++static void
++ht_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < HT_MAX; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(ht.active & bit) || x[id] != ht.x[id] || y[id] != ht.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++			}
++			ht.x[id] = x[id];
++			ht.y[id] = y[id];
++		} else if (ht.active & bit) {
++			sweet_hid_touch((int)id, 0, ht.x[id], ht.y[id]);
++		}
++	}
++	ht.active = mask;
++}
++
++static int
++ht_poll(void)
++{
++	uint8_t buf[FTS_TOUCH_LEN];
++	int x[HT_MAX] = {0}, y[HT_MAX] = {0};
++	uint32_t mask = 0, seen = 0;
++	int err = ht_fts_read(FTS_REG_TOUCH, buf, sizeof(buf));
++	if (err) {
++		return err;
++	}
++	unsigned n = buf[2] & 15u, active = 0;
++	if ((buf[0] & 0x70u) || n > HT_MAX) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < HT_MAX; ++i) {
++		const uint8_t *p = buf + 3u + 6u * i;
++		unsigned id = p[2] >> 4, event = p[0] >> 6;
++		if (id >= HT_MAX) {
++			break;
++		}
++		if (seen & (1u << id)) {
++			return EIO;
++		}
++		seen |= 1u << id;
++		if (event == 1u) {
++			continue; /* UP */
++		}
++		if (event == 3u) {
++			return EIO;
++		}
++		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
++		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
++		if (px > 1079 || py > 2399) {
++			return EIO;
++		}
++		mask |= 1u << id;
++		x[id] = (int)px;
++		y[id] = (int)py;
++		++active;
++	}
++	if (active != n) {
++		return EIO;
++	}
++	ht_report(mask, x, y);
++	return 0;
++}
++
++static bool
++ht_se_init(void)
++{
++	uint32_t fw = ht_rd(ht.se, SE_FW);
++	uint32_t tx = ht_rd(ht.se, SE_HW_TX), rx = ht_rd(ht.se, SE_HW_RX);
++	unsigned proto = (fw >> 8) & 0xffu;
++	printf("SWEET HTOUCH: se11 fw=%#x proto=%u status=%#x tx=%#x rx=%#x\n",
++	    fw, proto, ht_rd(ht.se, SE_STATUS), tx, rx);
++	/* proto 1 = SPI (2=UART, 3=I2C on sweet). 32-bit FIFO depth like sweet. */
++	if (proto != 1u || (ht_rd(ht.se, 0x64) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u) {
++		printf("SWEET HTOUCH: need ABL GENI SPI firmware + 32-bit FIFOs\n");
++		return false;
++	}
++	if (ht_rd(ht.se, SE_STATUS) & 0x1001u) {
++		printf("SWEET HTOUCH: SE11 already busy\n");
++		return false;
++	}
++	/* geni_se_init + FIFO mode (Linux order). */
++	ht_wr(ht.se, SE_CGC_CTRL, ht_rd(ht.se, SE_CGC_CTRL) | 0x7fu);
++	ht_wr(ht.se, SE_DMA_GENERAL, ht_rd(ht.se, SE_DMA_GENERAL) | 0x0fu);
++	ht_wr(ht.se, GENI_OUTPUT_CTRL, 0x7fu);
++	ht_wr(ht.se, SE_FORCE_DEFAULT, 1u);
++	ht_wr(ht.se, SE_DMA, 0);                    /* FIFO mode */
++	ht_wr(ht.se, SE_IRQ_CLR, 0xffffffffu);
++	ht_wr(ht.se, 0x648, 0xffffffffu);
++	/* SPI master config: MODE_0, MSB-first packing, 8-bit words, CS0,
++	 * automatic CS (clear CS_TOGGLE), active-low CS. */
++	ht_wr(ht.se, SE_SPI_CPHA, 0);
++	ht_wr(ht.se, SE_SPI_CPOL, 0);
++	ht_wr(ht.se, SE_SPI_LOOPBACK, 0);
++	ht_wr(ht.se, SE_SPI_DEMUX_INV, 0);          /* CS active-low */
++	ht_wr(ht.se, SE_SPI_DEMUX_SEL, 0);          /* CS0 */
++	ht_wr(ht.se, SE_SPI_TRANS_CFG, 0);          /* CS auto-toggle per cmd */
++	ht_wr(ht.se, SE_SPI_WORD_LEN, (8u - 4u));   /* (bits-4) & 0x3ff */
++	ht_wr(ht.se, SE_BYTE_GRAN, 0);              /* 4 bytes per FIFO word */
++	ht_wr(ht.se, SE_TX_PACK0, 0x0004380eu);
++	ht_wr(ht.se, SE_TX_PACK1, 0x000c3e0eu);
++	ht_wr(ht.se, SE_RX_PACK0, 0x0004380eu);
++	ht_wr(ht.se, SE_RX_PACK1, 0x000c3e0eu);
++	/* Clock: 6 MHz from 19.2 MHz XO. div = ceil(19.2/6) = 4 -> 4.8 MHz
++	 * (safe under the 12 MHz controller cap and 6 MHz device rating).
++	 * SE_MCLK = (div << 4) | enable, CLK_SEL = source 0. */
++	ht_wr(ht.se, SE_CLK_SEL, 0);
++	ht_wr(ht.se, SE_MCLK, (4u << 4) | 1u);
++	ht_wr(ht.se, SE_TX_WM, 1u);
++	ht_wr(ht.se, 0x810, 0);
++	ht_wr(ht.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
++	ht_wr(ht.se, SE_IRQ_EN, SE_EVENTS);
++	if ((ht_rd(ht.se, SE_TX_COUNT) & 0xfffffffu) ||
++	    (ht_rd(ht.se, SE_RX_COUNT) & 0x1ffffffu)) {
++		printf("SWEET HTOUCH: inherited FIFO data\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++ht_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 45;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sweethtouchdelay", &delay_s, sizeof(delay_s));
++	printf("SWEET HTOUCH: starting in %u s\n", delay_s);
++	ht_wait(delay_s * 1000u);
++	printf("SWEET HTOUCH: mapping GCC/TLMM/SE11\n");
++	ht.gcc = ml_io_map(HT_GCC_PA, 0x60000);
++	ht.gpio = ml_io_map(HT_TLMM_PA, 0x1000000);
++	ht.se = ml_io_map(HT_SE_PA, HT_SE_SIZE);
++	if (!ht.gcc || !ht.gpio || !ht.se) {
++		printf("SWEET HTOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	/* Power the 1.8 V vcc_i2c rail (pm8350c_l2 = RPMh "ldoc2"). */
++	int perr = sweet_rpmh_vreg_enable("ldoc2", 1800);
++	if (perr) {
++		printf("SWEET HTOUCH: ldoc2 RPMh enable failed %d; probes skipped\n", perr);
++		goto out;
++	}
++	if (!ht_clocks() || !ht_se_init()) {
++		goto out;
++	}
++	/* SPI data pins are muxed to the SE by the active pinctrl state; reset
++	 * and irq are plain GPIOs. Drive reset through the fts_reset_proc
++	 * sequence (>=200us low, then settle). */
++	ht_gpio(HT_GPIO_IRQ, 0, 3, 3, false);   /* irq: input, pull-up */
++	ht_gpio(HT_GPIO_RESET, 0, 0, 3, true);  /* reset: output */
++	ht_wr(ht.gpio, HT_GPIO_IO(HT_GPIO_RESET),
++	    ht_rd(ht.gpio, HT_GPIO_IO(HT_GPIO_RESET)) & ~2u);
++	ht_wait(5);
++	ht_wr(ht.gpio, HT_GPIO_IO(HT_GPIO_RESET),
++	    ht_rd(ht.gpio, HT_GPIO_IO(HT_GPIO_RESET)) | 2u);
++	ht_wait(300);
++	uint8_t id1 = 0, id2 = 0;
++	int e1 = ht_fts_read(FTS_REG_CHIP_ID, &id1, 1);
++	int e2 = ht_fts_read(FTS_REG_CHIP_ID2, &id2, 1);
++	printf("SWEET HTOUCH: probe fts chip-id err=%d/%d id=%02x:%02x irq=%#x\n",
++	    e1, e2, id1, id2, ht.irq_status);
++	bool fts = !e1 && !e2 && id1 == 0x56 && id2 == 0x52;
++	if (ht.dead || !fts) {
++		printf("SWEET HTOUCH: no Focaltech 5652 (dead=%d); stopping\n", ht.dead);
++		goto out;
++	}
++	printf("SWEET HTOUCH: Focaltech 5652 up, 1080x2400, poll=10ms\n");
++	unsigned errors = 0;
++	while (!ht.dead) {
++		int err = ht_poll();
++		if (err) {
++			if ((errors++ % 100u) == 0) {
++				printf("SWEET HTOUCH: poll err=%d irq=%#x\n", err, ht.irq_status);
++			}
++			if (errors == 10) {
++				ht_report(0, ht.x, ht.y);
++			}
++		} else {
++			errors = 0;
++		}
++		ht_wait(10);
++	}
++	ht_report(0, ht.x, ht.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_touch_haydn_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (ht.started) {
++		return;
++	}
++	ht.started = true;
++	(void)PE_parse_boot_argn("sweethtouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET HTOUCH: disabled (sweethtouch=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(ht_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET HTOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+Index: bsd/dev/sweet_keys_haydn.c
+===================================================================
+--- /dev/null
++++ bsd/dev/sweet_keys_haydn.c
+@@ -0,0 +1,232 @@
++/*
++ * SWEET haydn (SM8350) polled keys: PMIC PON power/vol-down + TLMM vol-up.
++ *
++ * Hardware (from the live Android DT dump):
++ *   - PMIC: pmk8350 SID 0, pon_hlos@0x1300 (SPMI @ 0xc440000)
++ *   - PON real-time status: base 0x1300 + 0x10 = 0x1310
++ *       bit0 = KPDPWR_N (power), bit1 = RESIN_N (volume down)
++ *   - volume up: gpio_keys, TLMM gpio 6, active low
++ *   - TLMM pinctrl@f000000 (lahaina)
++ *
++ * SPMI access is READ ONLY through the arbiter observer channel, exactly
++ * like sweet_keys.c: the sole MMIO write issues EXT_READL. No PMIC config,
++ * no IRQ acknowledge, no reset writes. Call once after the scheduler runs.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++void sweet_keys_haydn_init(void);
++
++/* SPMI arbiter (same layout family as sweet: pmic-arb v5). */
++#define HK_CORE_PA      0x0c440000u
++#define HK_OBS_PA       0x0e600000u
++#define HK_CNFG_PA      0x0c40a000u
++#define HK_NO_APID      0xffffu
++/* haydn PMIC addresses. PON is pmk8350 (SID 0); the PON RT status register
++ * lives at pon_hlos base 0x1300 + PON_RT_STS 0x10 = 0x1310. PMK8350 is a
++ * Gen3 PON: bit7 = KPDPWR_N (power), bit6 = RESIN_N (volume down) — NOT the
++ * Gen1/2 bit0/bit1 layout (pm8941-pwrkey.c PON_GEN3_*). */
++#define HK_PON_RT       0x1310u
++#define HK_PON_KPDPWR   (1u << 7)
++#define HK_PON_RESIN    (1u << 6)
++/* TLMM gpio 6 (volume up, active low). */
++#define HK_TLMM_PA      0x0f000000u
++#define HK_GPIO_VOLUP   6u
++#define HK_GPIO_IO(n)   ((uint32_t)(n) * 0x1000u + 4u)
++
++static vm_offset_t hk_core, hk_obs, hk_cnfg, hk_gpio;
++static uint16_t hk_pon_apid = HK_NO_APID;
++static uint32_t hk_version, hk_last_status;
++static bool hk_started;
++static int hk_sleep_chan;
++
++static uint32_t
++hk_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static uint16_t
++hk_find_apid(uint16_t ppid, uint32_t count)
++{
++	uint16_t found = HK_NO_APID;
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t map = hk_rd(hk_core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t owner = hk_rd(hk_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == HK_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++static bool
++hk_pmic_read(uint16_t apid, uint16_t addr, uint8_t *out)
++{
++	if (apid == HK_NO_APID) {
++		return false;
++	}
++	uint32_t off = 0x80u * apid;
++	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(hk_obs + off) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		hk_last_status = hk_rd(hk_obs, off + 0x08u);
++		if (hk_last_status & 1u) {
++			if (hk_last_status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)hk_rd(hk_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++hk_wait(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&hk_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++hk_thread(void *arg, wait_result_t result)
++{
++	int state[3] = {0, 0, 0};
++	unsigned errors = 0;
++	(void)arg;
++	(void)result;
++	for (;;) {
++		uint8_t pon = 0;
++		bool pok = hk_pmic_read(hk_pon_apid, HK_PON_RT, &pon);
++		/* vol-up is active-low on TLMM gpio 6. */
++		bool vup = !(hk_rd(hk_gpio, HK_GPIO_IO(HK_GPIO_VOLUP)) & 1u);
++		int now[3] = {!!(pon & HK_PON_KPDPWR), (int)vup, !!(pon & HK_PON_RESIN)};
++		if (!pok) {
++			if ((errors++ % 250u) == 0) {
++				printf("SWEET HKEYS: PON read error arb-status=%#x\n", hk_last_status);
++			}
++		} else {
++			errors = 0;
++		}
++		for (int k = 0; k < 3; ++k) {
++			bool ok = (k == 1) ? true : pok;
++			if (ok && now[k] != state[k]) {
++				state[k] = now[k];
++				printf("SWEET HKEYS: key=%d down=%d pon=%#x volup=%d\n",
++				    k, state[k], pon, (int)vup);
++				sweet_hid_key(k, state[k]);
++			}
++		}
++		hk_wait();
++	}
++}
++
++void
++sweet_keys_haydn_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (hk_started) {
++		return;
++	}
++	hk_started = true;
++	(void)PE_parse_boot_argn("sweethkeys", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET HKEYS: disabled (sweethkeys=0)\n");
++		return;
++	}
++	hk_core = ml_io_map(HK_CORE_PA, 0x2000);
++	hk_cnfg = ml_io_map(HK_CNFG_PA, 0x1000);
++	hk_obs = ml_io_map(HK_OBS_PA, 0x10000);
++	hk_gpio = ml_io_map(HK_TLMM_PA, 0x1000000);
++	if (!hk_core || !hk_cnfg || !hk_obs || !hk_gpio) {
++		printf("SWEET HKEYS: MMIO mapping failed\n");
++		return;
++	}
++	hk_version = hk_rd(hk_core, 0);
++	uint32_t count = hk_rd(hk_core, 4) & 0x7ffu;
++	if (hk_version < 0x50000000u || hk_version >= 0x70000000u ||
++	    count == 0 || count > 512) {
++		printf("SWEET HKEYS: unsupported arbiter version=%#x apids=%u\n",
++		    hk_version, count);
++		return;
++	}
++	/* PON PPID: pmk8350 SID 0 pon_hlos. PON is PPID 0x008 across PMIC5
++	 * parts (same as sweet). */
++	hk_pon_apid = hk_find_apid(0x008, count);
++	uint8_t pon = 0;
++	bool pok = hk_pmic_read(hk_pon_apid, HK_PON_RT, &pon);
++	printf("SWEET HKEYS: arb=%#x apids=%u pon-apid=%u pon_rt(%#x)=%#x/%d volup-gpio6=%d\n",
++	    hk_version, count, hk_pon_apid, HK_PON_RT, pon, pok,
++	    (int)(hk_rd(hk_gpio, HK_GPIO_IO(HK_GPIO_VOLUP)) & 1u));
++	kern_return_t kr = kernel_thread_start(hk_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET HKEYS: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+Index: bsd/dev/sweet_rpmh.c
+===================================================================
+--- bsd/dev/sweet_rpmh.c
++++ bsd/dev/sweet_rpmh.c
+@@ -439,9 +439,17 @@
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
+-		return EINVAL;
++	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary
++	 * resources. sweet votes L11C (ldoc11, ~3.2 V) for its touch rail;
++	 * haydn votes pm8350c_l2 (ldoc2, 1.8 V) for the FTS vcc_i2c rail. */
++	if (!res) {
++		return EINVAL;
++	}
++	bool sweet_ldo = !strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400;
++	bool haydn_ldo = !strcmp(res, "ldoc2") && mv >= 1700 && mv <= 1900;
++	if (!sweet_ldo && !haydn_ldo) {
++		printf("SWEET RPMH: unsupported res=%s mv=%u\n", res, mv);
++		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+ 		return EBUSY;
