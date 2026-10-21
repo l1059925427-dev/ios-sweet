@@ -235,7 +235,7 @@ new file mode 100644
 index 0000000..fb04ce3
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_haydn.c
-@@ -0,0 +1,525 @@
+@@ -0,0 +1,527 @@
 +/*
 + * SWEET haydn (SM8350) Focaltech FTS touch over GENI SPI.
 + *
@@ -574,22 +574,28 @@ index 0000000..fb04ce3
 +	if (err) {
 +		return err;
 +	}
-+	unsigned n = buf[2] & 15u, active = 0;
++	unsigned n = buf[2] & 15u;
 +	if ((buf[0] & 0x70u) || n > HT_MAX) {
 +		return EIO;
 +	}
-+	for (unsigned i = 0; i < HT_MAX; ++i) {
++	/* The report has exactly n slots and an UP point still occupies one
++	 * (it is how the chip says "this id lifted"), so iterate n slots and
++	 * let ht_report release any id that left the mask. The old code
++	 * iterated HT_MAX slots and rejected frames containing UP points
++	 * (active != n), which dropped every release until the 1 s error
++	 * timeout. */
++	for (unsigned i = 0; i < n; ++i) {
 +		const uint8_t *p = buf + 3u + 6u * i;
 +		unsigned id = p[2] >> 4, event = p[0] >> 6;
 +		if (id >= HT_MAX) {
-+			break;
++			return EIO;
 +		}
 +		if (seen & (1u << id)) {
 +			return EIO;
 +		}
 +		seen |= 1u << id;
 +		if (event == 1u) {
-+			continue; /* UP */
++			continue; /* UP: id stays out of mask -> released below */
 +		}
 +		if (event == 3u) {
 +			return EIO;
@@ -602,10 +608,6 @@ index 0000000..fb04ce3
 +		mask |= 1u << id;
 +		x[id] = (int)px;
 +		y[id] = (int)py;
-+		++active;
-+	}
-+	if (active != n) {
-+		return EIO;
 +	}
 +	ht_report(mask, x, y);
 +	return 0;
