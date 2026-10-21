@@ -13,7 +13,7 @@ diff --git a/bsd/dev/sweet_cpufreq_haydn.c b/bsd/dev/sweet_cpufreq_haydn.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_cpufreq_haydn.c
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,209 @@
 +/*
 + * SWEET haydn (SM8350) CPU frequency bring-up: measure the real core
 + * frequency with PMCCNTR_EL0 against the wall clock, then raise all three
