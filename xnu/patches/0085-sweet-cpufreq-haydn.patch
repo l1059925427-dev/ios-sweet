@@ -13,7 +13,7 @@ diff --git a/bsd/dev/sweet_cpufreq_haydn.c b/bsd/dev/sweet_cpufreq_haydn.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_cpufreq_haydn.c
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,217 @@
 +/*
 + * SWEET haydn (SM8350) CPU frequency bring-up: measure the real core
 + * frequency with PMCCNTR_EL0 against the wall clock, then raise all three
@@ -126,12 +126,19 @@ new file mode 100644
 +	return (c1 - c0) * 1000ull / ns;
 +}
 +
++static uint32_t
++scp_lut_khz(uint32_t row)
++{
++	uint32_t src = row >> 30, lval = row & 0xffu;
++	return src ? (19200u * lval) : 0;
++}
++
 +static void
 +scp_domain_raise(unsigned int idx, uint32_t pa, int do_raise)
 +{
 +	vm_offset_t base = ml_io_map(pa, 0x1000);
 +	unsigned int rows = 0, top = 0;
-+	uint32_t enable, dstate, cur, last = 0;
++	uint32_t enable, dstate, cur, last = 0, lut0 = 0, lutcur = 0;
 +	if (!base) {
 +		printf("SWEET CPUFREQ: domain%u %#x: ml_io_map failed\n", idx, pa);
 +		return;
@@ -141,28 +148,29 @@ new file mode 100644
 +	cur = scp_rd(base, SCP_PERF_STATE);
 +	for (unsigned int i = 0; i < SCP_LUT_MAX; ++i) {
 +		uint32_t row = scp_rd(base, SCP_FREQ_LUT + 4u * i);
++		if (i == 0) {
++			lut0 = row;
++		}
++		if (i == cur) {
++			lutcur = row;
++		}
 +		if (row != 0) {
 +			last = row;
 +			rows = i + 1;
 +		}
 +	}
-+	/* Row decode as in qcom-cpufreq-hw: src=bits[31:30], lval=bits[7:0];
-+	 * src!=0 -> kHz = 19.2 MHz_clock * lval. */
-+	{
-+		uint32_t src = last >> 30, lval = last & 0xffu;
-+		uint32_t khz = src ? (19200u * lval) : 0;
-+		printf("SWEET CPUFREQ: domain%u %#x: enable=%#x dstate=%#x perf=%u rows=%u top-lut=%#x top-khz=%u\n",
-+		    idx, pa, enable, dstate, cur, rows, last, khz);
-+	}
++	printf("SWEET CPUFREQ: domain%u %#x: enable=%#x dstate=%#x perf=%u cur-khz=%u min-khz=%u rows=%u top-khz=%u\n",
++	    idx, pa, enable, dstate, cur, scp_lut_khz(lutcur), scp_lut_khz(lut0),
++	    rows, scp_lut_khz(last));
 +	if (rows == 0 || !do_raise) {
 +		return;
 +	}
 +	top = rows - 1;
-+	if (cur == top) {
-+		printf("SWEET CPUFREQ: domain%u already at top perf state %u\n", idx, top);
-+		return;
++	/* EPSS is per-core DCVS: one PERF_STATE slot per core of the domain
++	 * (qcom-cpufreq-hw writes reg_perf_state + i * 4 for every related CPU). */
++	for (unsigned int i = 0; i < 4; ++i) {
++		*(volatile uint32_t *)(base + SCP_PERF_STATE + 4u * i) = top;
 +	}
-+	*(volatile uint32_t *)(base + SCP_PERF_STATE) = top;
 +	__asm__ volatile("dsb osh" ::: "memory");
 +	printf("SWEET CPUFREQ: domain%u perf %u -> %u (raised)\n", idx, cur, top);
 +}
