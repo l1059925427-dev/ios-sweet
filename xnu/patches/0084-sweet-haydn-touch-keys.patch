@@ -1,44 +1,241 @@
-Index: bsd/conf/files
-===================================================================
---- bsd/conf/files
-+++ bsd/conf/files
-@@ -106,6 +106,8 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..b632d72 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,8 @@ bsd/dev/random/randomdev.c		standard
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/sweet_sample.c			standard
-+bsd/dev/sweet_touch_haydn.c		standard
-+bsd/dev/sweet_keys_haydn.c		standard
- bsd/dev/mem.c				standard
- bsd/dev/munge.c 			optional config_requires_u32_munging
-
-Index: bsd/dev/sweet_ufs.c
-===================================================================
---- bsd/dev/sweet_ufs.c
-+++ bsd/dev/sweet_ufs.c
-@@ -47,6 +47,8 @@
- extern int hz;
- static void sweet_log_start(void);
- extern void sweet_sample_start(void);
-+extern void sweet_touch_haydn_init(void);
-+extern void sweet_keys_haydn_init(void);
-
- #define REG_CAP         0x00
- #define REG_IS          0x20
-@@ -599,6 +601,9 @@
- 	    su.writable ? "read-write" : "read-only", su.dma_pa);
- 	sweet_log_start();
- 	sweet_sample_start();
-+	/* haydn input drivers (Focaltech FTS over GENI SPI + PMIC PON keys). */
-+	sweet_touch_haydn_init();
-+	sweet_keys_haydn_init();
- 	return 0;
- }
-
-Index: bsd/dev/sweet_touch_haydn.c
-===================================================================
++bsd/dev/sweet_keys_haydn.c			standard
++bsd/dev/sweet_touch_haydn.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/sweet_keys_haydn.c b/bsd/dev/sweet_keys_haydn.c
+new file mode 100644
+index 0000000..48937d8
 --- /dev/null
-+++ bsd/dev/sweet_touch_haydn.c
-@@ -0,0 +1,540 @@
++++ b/bsd/dev/sweet_keys_haydn.c
+@@ -0,0 +1,188 @@
++/*
++ * SWEET haydn (SM8350) polled keys: PMIC PON power/vol-down + TLMM vol-up.
++ *
++ * Hardware (from the live Android DT dump):
++ *   - PMIC: pmk8350 SID 0, pon_hlos@0x1300 (SPMI @ 0xc440000)
++ *   - PON real-time status: base 0x1300 + 0x10 = 0x1310
++ *       bit0 = KPDPWR_N (power), bit1 = RESIN_N (volume down)
++ *   - volume up: gpio_keys, TLMM gpio 6, active low
++ *   - TLMM pinctrl@f000000 (lahaina)
++ *
++ * SPMI access is READ ONLY through the arbiter observer channel, exactly
++ * like sweet_keys.c: the sole MMIO write issues EXT_READL. No PMIC config,
++ * no IRQ acknowledge, no reset writes. Call once after the scheduler runs.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++void sweet_keys_haydn_init(void);
++
++/* SPMI arbiter (same layout family as sweet: pmic-arb v5). */
++#define HK_CORE_PA      0x0c440000u
++#define HK_OBS_PA       0x0e600000u
++#define HK_CNFG_PA      0x0c40a000u
++#define HK_NO_APID      0xffffu
++/* haydn PMIC addresses. PON is pmk8350 (SID 0); the PON RT status register
++ * lives at pon_hlos base 0x1300 + PON_RT_STS 0x10 = 0x1310. PMK8350 is a
++ * Gen3 PON: bit7 = KPDPWR_N (power), bit6 = RESIN_N (volume down) — NOT the
++ * Gen1/2 bit0/bit1 layout (pm8941-pwrkey.c PON_GEN3_*). */
++#define HK_PON_RT       0x1310u
++#define HK_PON_KPDPWR   (1u << 7)
++#define HK_PON_RESIN    (1u << 6)
++/* TLMM gpio 6 (volume up, active low). */
++#define HK_TLMM_PA      0x0f000000u
++#define HK_GPIO_VOLUP   6u
++#define HK_GPIO_IO(n)   ((uint32_t)(n) * 0x1000u + 4u)
++
++static vm_offset_t hk_core, hk_obs, hk_cnfg, hk_gpio;
++static uint16_t hk_pon_apid = HK_NO_APID;
++static uint32_t hk_version, hk_last_status;
++static bool hk_started;
++static int hk_sleep_chan;
++
++static uint32_t
++hk_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static uint16_t
++hk_find_apid(uint16_t ppid, uint32_t count)
++{
++	uint16_t found = HK_NO_APID;
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t map = hk_rd(hk_core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t owner = hk_rd(hk_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == HK_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++static bool
++hk_pmic_read(uint16_t apid, uint16_t addr, uint8_t *out)
++{
++	if (apid == HK_NO_APID) {
++		return false;
++	}
++	uint32_t off = 0x80u * apid;
++	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(hk_obs + off) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		hk_last_status = hk_rd(hk_obs, off + 0x08u);
++		if (hk_last_status & 1u) {
++			if (hk_last_status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)hk_rd(hk_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++hk_wait(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&hk_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++hk_thread(void *arg, wait_result_t result)
++{
++	int state[3] = {0, 0, 0};
++	unsigned errors = 0;
++	(void)arg;
++	(void)result;
++	for (;;) {
++		uint8_t pon = 0;
++		bool pok = hk_pmic_read(hk_pon_apid, HK_PON_RT, &pon);
++		/* vol-up is active-low on TLMM gpio 6. */
++		bool vup = !(hk_rd(hk_gpio, HK_GPIO_IO(HK_GPIO_VOLUP)) & 1u);
++		int now[3] = {!!(pon & HK_PON_KPDPWR), (int)vup, !!(pon & HK_PON_RESIN)};
++		if (!pok) {
++			if ((errors++ % 250u) == 0) {
++				printf("SWEET HKEYS: PON read error arb-status=%#x\n", hk_last_status);
++			}
++		} else {
++			errors = 0;
++		}
++		for (int k = 0; k < 3; ++k) {
++			bool ok = (k == 1) ? true : pok;
++			if (ok && now[k] != state[k]) {
++				state[k] = now[k];
++				printf("SWEET HKEYS: key=%d down=%d pon=%#x volup=%d\n",
++				    k, state[k], pon, (int)vup);
++				sweet_hid_key(k, state[k]);
++			}
++		}
++		hk_wait();
++	}
++}
++
++void
++sweet_keys_haydn_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (hk_started) {
++		return;
++	}
++	hk_started = true;
++	(void)PE_parse_boot_argn("sweethkeys", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET HKEYS: disabled (sweethkeys=0)\n");
++		return;
++	}
++	hk_core = ml_io_map(HK_CORE_PA, 0x2000);
++	hk_cnfg = ml_io_map(HK_CNFG_PA, 0x1000);
++	hk_obs = ml_io_map(HK_OBS_PA, 0x10000);
++	hk_gpio = ml_io_map(HK_TLMM_PA, 0x1000000);
++	if (!hk_core || !hk_cnfg || !hk_obs || !hk_gpio) {
++		printf("SWEET HKEYS: MMIO mapping failed\n");
++		return;
++	}
++	hk_version = hk_rd(hk_core, 0);
++	uint32_t count = hk_rd(hk_core, 4) & 0x7ffu;
++	if (hk_version < 0x50000000u || hk_version >= 0x70000000u ||
++	    count == 0 || count > 512) {
++		printf("SWEET HKEYS: unsupported arbiter version=%#x apids=%u\n",
++		    hk_version, count);
++		return;
++	}
++	/* PON PPID: pmk8350 SID 0 pon_hlos. PON is PPID 0x008 across PMIC5
++	 * parts (same as sweet). */
++	hk_pon_apid = hk_find_apid(0x008, count);
++	uint8_t pon = 0;
++	bool pok = hk_pmic_read(hk_pon_apid, HK_PON_RT, &pon);
++	printf("SWEET HKEYS: arb=%#x apids=%u pon-apid=%u pon_rt(%#x)=%#x/%d volup-gpio6=%d\n",
++	    hk_version, count, hk_pon_apid, HK_PON_RT, pon, pok,
++	    (int)(hk_rd(hk_gpio, HK_GPIO_IO(HK_GPIO_VOLUP)) & 1u));
++	kern_return_t kr = kernel_thread_start(hk_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET HKEYS: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..4a1489b 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -327,9 +327,17 @@ rh_send(uint32_t address, unsigned mv)
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* Board-specific helper: only the two known rails are accepted. */
++	if (!res) {
++		return EINVAL;
++	}
++	/* sweet (SM7150): PM6150 L11C, 2.95-3.4 V */
++	bool sweet_ldo = !strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400;
++	/* haydn (SM8350): PM8350C L2 (ldoc2), 1.8 V, Focaltech VCC */
++	bool haydn_ldo = !strcmp(res, "ldoc2") && mv >= 1700 && mv <= 1900;
++	if (!sweet_ldo && !haydn_ldo) {
++		printf("SWEET RPMH: %s %u mV is not ldoc11/2.95-3.4 V or ldoc2/1.7-1.9 V\n",
++		    res, mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/sweet_touch_haydn.c b/bsd/dev/sweet_touch_haydn.c
+new file mode 100644
+index 0000000..fb04ce3
+--- /dev/null
++++ b/bsd/dev/sweet_touch_haydn.c
+@@ -0,0 +1,523 @@
 +/*
 + * SWEET haydn (SM8350) Focaltech FTS touch over GENI SPI.
 + *
@@ -562,222 +759,26 @@ Index: bsd/dev/sweet_touch_haydn.c
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
-Index: bsd/dev/sweet_keys_haydn.c
-===================================================================
---- /dev/null
-+++ bsd/dev/sweet_keys_haydn.c
-@@ -0,0 +1,232 @@
-+/*
-+ * SWEET haydn (SM8350) polled keys: PMIC PON power/vol-down + TLMM vol-up.
-+ *
-+ * Hardware (from the live Android DT dump):
-+ *   - PMIC: pmk8350 SID 0, pon_hlos@0x1300 (SPMI @ 0xc440000)
-+ *   - PON real-time status: base 0x1300 + 0x10 = 0x1310
-+ *       bit0 = KPDPWR_N (power), bit1 = RESIN_N (volume down)
-+ *   - volume up: gpio_keys, TLMM gpio 6, active low
-+ *   - TLMM pinctrl@f000000 (lahaina)
-+ *
-+ * SPMI access is READ ONLY through the arbiter observer channel, exactly
-+ * like sweet_keys.c: the sole MMIO write issues EXT_READL. No PMIC config,
-+ * no IRQ acknowledge, no reset writes. Call once after the scheduler runs.
-+ */
-+#if defined(ARM64_BOARD_CONFIG_SWEET)
-+#include <sys/param.h>
-+#include <sys/systm.h>
-+#include <kern/clock.h>
-+#include <kern/thread.h>
-+#include <kern/sched_prim.h>
-+#include <machine/machine_routines.h>
-+#include <pexpert/pexpert.h>
-+
-+extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-+extern void sweet_hid_key(int key, int down);
-+void sweet_keys_haydn_init(void);
-+
-+/* SPMI arbiter (same layout family as sweet: pmic-arb v5). */
-+#define HK_CORE_PA      0x0c440000u
-+#define HK_OBS_PA       0x0e600000u
-+#define HK_CNFG_PA      0x0c40a000u
-+#define HK_NO_APID      0xffffu
-+/* haydn PMIC addresses. PON is pmk8350 (SID 0); the PON RT status register
-+ * lives at pon_hlos base 0x1300 + PON_RT_STS 0x10 = 0x1310. PMK8350 is a
-+ * Gen3 PON: bit7 = KPDPWR_N (power), bit6 = RESIN_N (volume down) — NOT the
-+ * Gen1/2 bit0/bit1 layout (pm8941-pwrkey.c PON_GEN3_*). */
-+#define HK_PON_RT       0x1310u
-+#define HK_PON_KPDPWR   (1u << 7)
-+#define HK_PON_RESIN    (1u << 6)
-+/* TLMM gpio 6 (volume up, active low). */
-+#define HK_TLMM_PA      0x0f000000u
-+#define HK_GPIO_VOLUP   6u
-+#define HK_GPIO_IO(n)   ((uint32_t)(n) * 0x1000u + 4u)
-+
-+static vm_offset_t hk_core, hk_obs, hk_cnfg, hk_gpio;
-+static uint16_t hk_pon_apid = HK_NO_APID;
-+static uint32_t hk_version, hk_last_status;
-+static bool hk_started;
-+static int hk_sleep_chan;
-+
-+static uint32_t
-+hk_rd(vm_offset_t base, uint32_t off)
-+{
-+	uint32_t v = *(volatile uint32_t *)(base + off);
-+	__asm__ volatile("dmb oshld" ::: "memory");
-+	return v;
-+}
-+
-+static uint16_t
-+hk_find_apid(uint16_t ppid, uint32_t count)
-+{
-+	uint16_t found = HK_NO_APID;
-+	for (uint32_t i = 0; i < count; ++i) {
-+		uint32_t map = hk_rd(hk_core, 0x900u + 4u * i);
-+		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
-+			continue;
-+		}
-+		uint32_t owner = hk_rd(hk_cnfg, 0x700u + 4u * i) & 7u;
-+		if (found == HK_NO_APID || owner == 0) {
-+			found = (uint16_t)i;
-+		}
-+	}
-+	return found;
-+}
-+
-+static bool
-+hk_pmic_read(uint16_t apid, uint16_t addr, uint8_t *out)
-+{
-+	if (apid == HK_NO_APID) {
-+		return false;
-+	}
-+	uint32_t off = 0x80u * apid;
-+	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
-+	__asm__ volatile("dmb oshst" ::: "memory");
-+	*(volatile uint32_t *)(hk_obs + off) = cmd;
-+	__asm__ volatile("dsb osh" ::: "memory");
-+	for (unsigned i = 0; i < 1000; ++i) {
-+		hk_last_status = hk_rd(hk_obs, off + 0x08u);
-+		if (hk_last_status & 1u) {
-+			if (hk_last_status & 0x0eu) {
-+				return false;
-+			}
-+			*out = (uint8_t)hk_rd(hk_obs, off + 0x18u);
-+			return true;
-+		}
-+		delay(1);
-+	}
-+	return false;
-+}
-+
-+static void
-+hk_wait(void)
-+{
-+	uint64_t deadline;
-+	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
-+	(void)assert_wait_deadline(&hk_sleep_chan, THREAD_UNINT, deadline);
-+	thread_block(THREAD_CONTINUE_NULL);
-+}
-+
-+static void
-+hk_thread(void *arg, wait_result_t result)
-+{
-+	int state[3] = {0, 0, 0};
-+	unsigned errors = 0;
-+	(void)arg;
-+	(void)result;
-+	for (;;) {
-+		uint8_t pon = 0;
-+		bool pok = hk_pmic_read(hk_pon_apid, HK_PON_RT, &pon);
-+		/* vol-up is active-low on TLMM gpio 6. */
-+		bool vup = !(hk_rd(hk_gpio, HK_GPIO_IO(HK_GPIO_VOLUP)) & 1u);
-+		int now[3] = {!!(pon & HK_PON_KPDPWR), (int)vup, !!(pon & HK_PON_RESIN)};
-+		if (!pok) {
-+			if ((errors++ % 250u) == 0) {
-+				printf("SWEET HKEYS: PON read error arb-status=%#x\n", hk_last_status);
-+			}
-+		} else {
-+			errors = 0;
-+		}
-+		for (int k = 0; k < 3; ++k) {
-+			bool ok = (k == 1) ? true : pok;
-+			if (ok && now[k] != state[k]) {
-+				state[k] = now[k];
-+				printf("SWEET HKEYS: key=%d down=%d pon=%#x volup=%d\n",
-+				    k, state[k], pon, (int)vup);
-+				sweet_hid_key(k, state[k]);
-+			}
-+		}
-+		hk_wait();
-+	}
-+}
-+
-+void
-+sweet_keys_haydn_init(void)
-+{
-+	int enabled = 1;
-+	thread_t thread;
-+	if (hk_started) {
-+		return;
-+	}
-+	hk_started = true;
-+	(void)PE_parse_boot_argn("sweethkeys", &enabled, sizeof(enabled));
-+	if (!enabled) {
-+		printf("SWEET HKEYS: disabled (sweethkeys=0)\n");
-+		return;
-+	}
-+	hk_core = ml_io_map(HK_CORE_PA, 0x2000);
-+	hk_cnfg = ml_io_map(HK_CNFG_PA, 0x1000);
-+	hk_obs = ml_io_map(HK_OBS_PA, 0x10000);
-+	hk_gpio = ml_io_map(HK_TLMM_PA, 0x1000000);
-+	if (!hk_core || !hk_cnfg || !hk_obs || !hk_gpio) {
-+		printf("SWEET HKEYS: MMIO mapping failed\n");
-+		return;
-+	}
-+	hk_version = hk_rd(hk_core, 0);
-+	uint32_t count = hk_rd(hk_core, 4) & 0x7ffu;
-+	if (hk_version < 0x50000000u || hk_version >= 0x70000000u ||
-+	    count == 0 || count > 512) {
-+		printf("SWEET HKEYS: unsupported arbiter version=%#x apids=%u\n",
-+		    hk_version, count);
-+		return;
-+	}
-+	/* PON PPID: pmk8350 SID 0 pon_hlos. PON is PPID 0x008 across PMIC5
-+	 * parts (same as sweet). */
-+	hk_pon_apid = hk_find_apid(0x008, count);
-+	uint8_t pon = 0;
-+	bool pok = hk_pmic_read(hk_pon_apid, HK_PON_RT, &pon);
-+	printf("SWEET HKEYS: arb=%#x apids=%u pon-apid=%u pon_rt(%#x)=%#x/%d volup-gpio6=%d\n",
-+	    hk_version, count, hk_pon_apid, HK_PON_RT, pon, pok,
-+	    (int)(hk_rd(hk_gpio, HK_GPIO_IO(HK_GPIO_VOLUP)) & 1u));
-+	kern_return_t kr = kernel_thread_start(hk_thread, NULL, &thread);
-+	if (kr == KERN_SUCCESS) {
-+		thread_deallocate(thread);
-+	} else {
-+		printf("SWEET HKEYS: kernel_thread_start failed %d\n", kr);
-+	}
-+}
-+#endif /* ARM64_BOARD_CONFIG_SWEET */
-Index: bsd/dev/sweet_rpmh.c
-===================================================================
---- bsd/dev/sweet_rpmh.c
-+++ bsd/dev/sweet_rpmh.c
-@@ -439,9 +439,17 @@
- int
- sweet_rpmh_vreg_enable(const char *res, unsigned mv)
- {
--	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
--	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
--		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
--		return EINVAL;
-+	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary
-+	 * resources. sweet votes L11C (ldoc11, ~3.2 V) for its touch rail;
-+	 * haydn votes pm8350c_l2 (ldoc2, 1.8 V) for the FTS vcc_i2c rail. */
-+	if (!res) {
-+		return EINVAL;
-+	}
-+	bool sweet_ldo = !strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400;
-+	bool haydn_ldo = !strcmp(res, "ldoc2") && mv >= 1700 && mv <= 1900;
-+	if (!sweet_ldo && !haydn_ldo) {
-+		printf("SWEET RPMH: unsupported res=%s mv=%u\n", res, mv);
-+		return EINVAL;
- 	}
- 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
- 		return EBUSY;
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..de81503 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,8 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_keys_haydn_init(void);
++extern void sweet_touch_haydn_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +661,9 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	/* haydn (SM8350): GENI SPI Focaltech 5652 + PMK8350 PON keys */
++	sweet_keys_haydn_init();
++	sweet_touch_haydn_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
