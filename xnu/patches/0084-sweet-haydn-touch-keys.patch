@@ -235,7 +235,7 @@ new file mode 100644
 index 0000000..fb04ce3
 --- /dev/null
 +++ b/bsd/dev/sweet_touch_haydn.c
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,525 @@
 +/*
 + * SWEET haydn (SM8350) Focaltech FTS touch over GENI SPI.
 + *
