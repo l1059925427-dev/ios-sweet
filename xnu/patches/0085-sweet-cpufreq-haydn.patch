@@ -141,14 +141,19 @@ new file mode 100644
 +	cur = scp_rd(base, SCP_PERF_STATE);
 +	for (unsigned int i = 0; i < SCP_LUT_MAX; ++i) {
 +		uint32_t row = scp_rd(base, SCP_FREQ_LUT + 4u * i);
-+		if (row == 0) {
-+			break;
++		if (row != 0) {
++			last = row;
++			rows = i + 1;
 +		}
-+		last = row;
-+		rows = i + 1;
 +	}
-+	printf("SWEET CPUFREQ: domain%u %#x: enable=%#x dstate=%#x perf=%u rows=%u last-lut=%#x\n",
-+	    idx, pa, enable, dstate, cur, rows, last);
++	/* Row decode as in qcom-cpufreq-hw: src=bits[31:30], lval=bits[7:0];
++	 * src!=0 -> kHz = 19.2 MHz_clock * lval. */
++	{
++		uint32_t src = last >> 30, lval = last & 0xffu;
++		uint32_t khz = src ? (19200u * lval) : 0;
++		printf("SWEET CPUFREQ: domain%u %#x: enable=%#x dstate=%#x perf=%u rows=%u top-lut=%#x top-khz=%u\n",
++		    idx, pa, enable, dstate, cur, rows, last, khz);
++	}
 +	if (rows == 0 || !do_raise) {
 +		return;
 +	}
