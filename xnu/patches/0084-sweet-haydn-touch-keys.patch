@@ -176,7 +176,7 @@ index 0000000..48937d8
 +	hk_core = ml_io_map(HK_CORE_PA, 0x2000);
 +	hk_cnfg = ml_io_map(HK_CNFG_PA, 0x1000);
 +	hk_obs = ml_io_map(HK_OBS_PA, 0x10000);
-+	hk_gpio = ml_io_map(HK_TLMM_PA, 0x1000000);
++	hk_gpio = ml_io_map(HK_TLMM_PA, 0x7000); /* gpio6 @0x6000; full 16MB TLMM map fails NO_SPACE */
 +	if (!hk_core || !hk_cnfg || !hk_obs || !hk_gpio) {
 +		printf("SWEET HKEYS: MMIO mapping failed\n");
 +		return;
@@ -679,7 +679,7 @@ index 0000000..fb04ce3
 +	ht_wait(delay_s * 1000u);
 +	printf("SWEET HTOUCH: mapping GCC/TLMM/SE11\n");
 +	ht.gcc = ml_io_map(HT_GCC_PA, 0x60000);
-+	ht.gpio = ml_io_map(HT_TLMM_PA, 0x1000000);
++	ht.gpio = ml_io_map(HT_TLMM_PA, 0x14c000); /* pins 330/331 @0x14a000+; 16MB map fails NO_SPACE */
 +	ht.se = ml_io_map(HT_SE_PA, HT_SE_SIZE);
 +	if (!ht.gcc || !ht.gpio || !ht.se) {
 +		printf("SWEET HTOUCH: MMIO mapping failed\n");
