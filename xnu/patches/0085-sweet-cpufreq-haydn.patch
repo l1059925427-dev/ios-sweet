@@ -13,7 +13,7 @@ diff --git a/bsd/dev/sweet_cpufreq_haydn.c b/bsd/dev/sweet_cpufreq_haydn.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_cpufreq_haydn.c
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,194 @@
 +/*
 + * SWEET haydn (SM8350) CPU frequency bring-up: measure the real core
 + * frequency with PMCCNTR_EL0 against the wall clock, then raise all three
@@ -35,6 +35,12 @@ new file mode 100644
 + * domains: 0x18591000 / 0x18592000 / 0x18593000.
 + *
 + * Boot arg sweetcpufreq=0 disables the whole thing.
++ *
++ * Staged bring-up (v52diag black-screened with the thread started inside the
++ * CPU-start window, before its first print, so PMU/EPSS could not be
++ * exonerated): the thread now sleeps 2 s first and the boot arg selects how
++ * far it goes - 1 thread + one log line only (default), 2 add the PMU
++ * measurement, 3 add the EPSS raise. 0 still disables everything.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -154,11 +160,20 @@ new file mode 100644
 +scp_thread(void *arg, wait_result_t result)
 +{
 +	uint64_t before, after;
-+	(void)arg;
++	int stage = (int)(uintptr_t)arg;
 +	(void)result;
++	/* Let bsd init and the SMP bring-up finish first. */
++	scp_wait(2000);
++	printf("SWEET CPUFREQ: thread alive stage=%d\n", stage);
++	if (stage < 2) {
++		return;
++	}
 +	scp_pmu_enable();
 +	before = scp_measure_mhz(200);
 +	printf("SWEET CPUFREQ: %llu MHz before raise\n", before);
++	if (stage < 3) {
++		return;
++	}
 +	for (unsigned int i = 0; i < 3; ++i) {
 +		scp_domain_raise(i, scp_domains[i]);
 +	}
@@ -170,19 +185,22 @@ new file mode 100644
 +void
 +sweet_cpufreq_haydn_init(void)
 +{
-+	int enabled = 1;
++	int stage = 1;
 +	thread_t thread;
 +	static bool started;
 +	if (started) {
 +		return;
 +	}
 +	started = true;
-+	(void)PE_parse_boot_argn("sweetcpufreq", &enabled, sizeof(enabled));
-+	if (!enabled) {
++	(void)PE_parse_boot_argn("sweetcpufreq", &stage, sizeof(stage));
++	if (stage <= 0) {
 +		printf("SWEET CPUFREQ: disabled (sweetcpufreq=0)\n");
 +		return;
 +	}
-+	kern_return_t kr = kernel_thread_start(scp_thread, NULL, &thread);
++	if (stage > 3) {
++		stage = 3;
++	}
++	kern_return_t kr = kernel_thread_start(scp_thread, (void *)(uintptr_t)stage, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);
 +	} else {
