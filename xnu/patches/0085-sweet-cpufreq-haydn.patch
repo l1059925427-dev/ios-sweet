@@ -13,7 +13,7 @@ diff --git a/bsd/dev/sweet_cpufreq_haydn.c b/bsd/dev/sweet_cpufreq_haydn.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_cpufreq_haydn.c
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,204 @@
 +/*
 + * SWEET haydn (SM8350) CPU frequency bring-up: measure the real core
 + * frequency with PMCCNTR_EL0 against the wall clock, then raise all three
@@ -40,7 +40,9 @@ new file mode 100644
 + * CPU-start window, before its first print, so PMU/EPSS could not be
 + * exonerated): the thread now sleeps 2 s first and the boot arg selects how
 + * far it goes - 1 thread + one log line only (default), 2 add the PMU
-+ * measurement, 3 add the EPSS raise. 0 still disables everything.
++ * measurement (raw counters are logged; on haydn the ratio is not core MHz),
++ * 3 add a read-only EPSS dump (perf state + LUT rows), 4 add the EPSS raise.
++ * 0 still disables everything.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -114,6 +116,10 @@ new file mode 100644
 +	uint64_t c1 = scp_cycles();
 +	uint64_t t1 = mach_absolute_time();
 +	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	/* Raw values: on haydn the PMU counter does not count core clocks, so
++	 * the ratio has to be interpreted by hand from these numbers. */
++	printf("SWEET CPUFREQ: raw c0=%llu c1=%llu dc=%llu t0=%llu t1=%llu ns=%llu\n",
++	    c0, c1, c1 - c0, t0, t1, ns);
 +	if (ns == 0) {
 +		return 0;
 +	}
@@ -121,7 +127,7 @@ new file mode 100644
 +}
 +
 +static void
-+scp_domain_raise(unsigned int idx, uint32_t pa)
++scp_domain_raise(unsigned int idx, uint32_t pa, int do_raise)
 +{
 +	vm_offset_t base = ml_io_map(pa, 0x1000);
 +	unsigned int rows = 0, top = 0;
@@ -143,7 +149,7 @@ new file mode 100644
 +	}
 +	printf("SWEET CPUFREQ: domain%u %#x: enable=%#x dstate=%#x perf=%u rows=%u last-lut=%#x\n",
 +	    idx, pa, enable, dstate, cur, rows, last);
-+	if (rows == 0) {
++	if (rows == 0 || !do_raise) {
 +		return;
 +	}
 +	top = rows - 1;
@@ -159,12 +165,13 @@ new file mode 100644
 +static void
 +scp_thread(void *arg, wait_result_t result)
 +{
-+	uint64_t before, after;
++	uint64_t before, after, cntfrq = 0;
 +	int stage = (int)(uintptr_t)arg;
 +	(void)result;
 +	/* Let bsd init and the SMP bring-up finish first. */
 +	scp_wait(2000);
-+	printf("SWEET CPUFREQ: thread alive stage=%d\n", stage);
++	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
++	printf("SWEET CPUFREQ: thread alive stage=%d cntfrq=%llu\n", stage, cntfrq);
 +	if (stage < 2) {
 +		return;
 +	}
@@ -175,7 +182,10 @@ new file mode 100644
 +		return;
 +	}
 +	for (unsigned int i = 0; i < 3; ++i) {
-+		scp_domain_raise(i, scp_domains[i]);
++		scp_domain_raise(i, scp_domains[i], stage >= 4);
++	}
++	if (stage < 4) {
++		return;
 +	}
 +	scp_wait(50);
 +	after = scp_measure_mhz(200);
@@ -197,8 +207,8 @@ new file mode 100644
 +		printf("SWEET CPUFREQ: disabled (sweetcpufreq=0)\n");
 +		return;
 +	}
-+	if (stage > 3) {
-+		stage = 3;
++	if (stage > 4) {
++		stage = 4;
 +	}
 +	kern_return_t kr = kernel_thread_start(scp_thread, (void *)(uintptr_t)stage, &thread);
 +	if (kr == KERN_SUCCESS) {
