@@ -16,7 +16,7 @@ new file mode 100644
 index 0000000..48937d8
 --- /dev/null
 +++ b/bsd/dev/sweet_keys_haydn.c
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,189 @@
 +/*
 + * SWEET haydn (SM8350) polled keys: PMIC PON power/vol-down + TLMM vol-up.
 + *
