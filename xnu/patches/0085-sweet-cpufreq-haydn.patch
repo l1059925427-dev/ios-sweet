@@ -13,7 +13,7 @@ diff --git a/bsd/dev/sweet_cpufreq_haydn.c b/bsd/dev/sweet_cpufreq_haydn.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_cpufreq_haydn.c
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,260 @@
 +/*
 + * SWEET haydn (SM8350) CPU frequency bring-up: measure the real core
 + * frequency with PMCCNTR_EL0 against the wall clock, then raise all three
@@ -42,6 +42,8 @@ new file mode 100644
 + * far it goes - 1 thread + one log line only (default), 2 add the PMU
 + * measurement (raw counters are logged; on haydn the ratio is not core MHz),
 + * 3 add a read-only EPSS dump (perf state + LUT rows), 4 add the EPSS raise.
++ * Boot arg sweetsmpsweep=1 additionally runs a read-only PSCI AFFINITY_INFO
++ * sweep (which affinities the firmware exposes) at 2 s and again at 42 s.
 + * 0 still disables everything.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -133,6 +135,37 @@ new file mode 100644
 +	return src ? (19200u * lval) : 0;
 +}
 +
++/* SMCCC/PSCI call with the signed result in x0 (same shape as 0065). */
++static int32_t
++scp_psci_call(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++/* Read-only PSCI AFFINITY_INFO sweep: which affinities does the MIUI
++ * firmware actually expose? 0 = ON, 1 = OFF, 2 = ON_PENDING,
++ * -1 = NOT_SUPPORTED, -2 = INVALID_PARAMETERS (affinity not present). */
++static void
++scp_affinity_sweep(void)
++{
++	for (uint64_t cl = 0; cl < 4; ++cl) {
++		printf("SWEET CPUFREQ: affinity aff1=%llu:", cl);
++		for (uint64_t core = 0; core < 4; ++core) {
++			uint64_t aff = (cl << 8) | core;
++			int32_t rc = scp_psci_call(0xC4000004ULL, aff, 0, 0);
++			printf(" %llx=%d", aff, rc);
++		}
++		printf("\n");
++	}
++}
++
 +static void
 +scp_domain_raise(unsigned int idx, uint32_t pa, int do_raise)
 +{
@@ -172,37 +205,47 @@ new file mode 100644
 +		*(volatile uint32_t *)(base + SCP_PERF_STATE + 4u * i) = top;
 +	}
 +	__asm__ volatile("dsb osh" ::: "memory");
-+	printf("SWEET CPUFREQ: domain%u perf %u -> %u (raised)\n", idx, cur, top);
++	printf("SWEET CPUFREQ: domain%u perf %u -> %u (raised, readback %u/%u/%u/%u)\n",
++	    idx, cur, top, scp_rd(base, SCP_PERF_STATE),
++	    scp_rd(base, SCP_PERF_STATE + 4u), scp_rd(base, SCP_PERF_STATE + 8u),
++	    scp_rd(base, SCP_PERF_STATE + 12u));
 +}
 +
 +static void
 +scp_thread(void *arg, wait_result_t result)
 +{
-+	uint64_t before, after, cntfrq = 0;
++	uint64_t before = 0, after = 0, cntfrq = 0;
 +	int stage = (int)(uintptr_t)arg;
++	int sweep = 0;
 +	(void)result;
++	(void)PE_parse_boot_argn("sweetsmpsweep", &sweep, sizeof(sweep));
 +	/* Let bsd init and the SMP bring-up finish first. */
 +	scp_wait(2000);
 +	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
-+	printf("SWEET CPUFREQ: thread alive stage=%d cntfrq=%llu\n", stage, cntfrq);
-+	if (stage < 2) {
-+		return;
++	printf("SWEET CPUFREQ: thread alive stage=%d cntfrq=%llu sweep=%d\n",
++	    stage, cntfrq, sweep);
++	if (stage >= 2) {
++		scp_pmu_enable();
++		before = scp_measure_mhz(200);
++		printf("SWEET CPUFREQ: %llu MHz before raise\n", before);
 +	}
-+	scp_pmu_enable();
-+	before = scp_measure_mhz(200);
-+	printf("SWEET CPUFREQ: %llu MHz before raise\n", before);
-+	if (stage < 3) {
-+		return;
++	if (stage >= 3) {
++		for (unsigned int i = 0; i < 3; ++i) {
++			scp_domain_raise(i, scp_domains[i], stage >= 4);
++		}
 +	}
-+	for (unsigned int i = 0; i < 3; ++i) {
-+		scp_domain_raise(i, scp_domains[i], stage >= 4);
++	if (stage >= 4) {
++		scp_wait(50);
++		after = scp_measure_mhz(200);
++		printf("SWEET CPUFREQ: %llu MHz after raise\n", after);
 +	}
-+	if (stage < 4) {
-+		return;
++	if (sweep) {
++		scp_affinity_sweep();
++		/* Repeat late so a diag build shows the table over the idle UI. */
++		scp_wait(40000);
++		printf("SWEET CPUFREQ: sweep 2 (late)\n");
++		scp_affinity_sweep();
 +	}
-+	scp_wait(50);
-+	after = scp_measure_mhz(200);
-+	printf("SWEET CPUFREQ: %llu MHz after raise\n", after);
 +}
 +
 +void

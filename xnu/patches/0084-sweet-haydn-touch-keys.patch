@@ -121,7 +121,8 @@ index 0000000..48937d8
 +hk_wait(void)
 +{
 +	uint64_t deadline;
-+	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	/* 5 ms: the poll loop is the main key-latency term (was 20 ms). */
++	clock_interval_to_deadline(5, NSEC_PER_MSEC, &deadline);
 +	(void)assert_wait_deadline(&hk_sleep_chan, THREAD_UNINT, deadline);
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
