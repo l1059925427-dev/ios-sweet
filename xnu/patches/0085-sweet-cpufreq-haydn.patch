@@ -155,7 +155,7 @@ new file mode 100644
 +static void
 +scp_affinity_sweep(void)
 +{
-+	for (uint64_t cl = 0; cl < 4; ++cl) {
++	for (uint64_t cl = 0; cl < 8; ++cl) {
 +		printf("SWEET CPUFREQ: affinity aff1=%llu:", cl);
 +		for (uint64_t core = 0; core < 4; ++core) {
 +			uint64_t aff = (cl << 8) | core;

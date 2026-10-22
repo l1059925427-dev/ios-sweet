@@ -145,16 +145,24 @@ def build(seed=None, qemu=False, highmem=False, haydn=False, add_fbcon=True):
     # SWEET SMP: eight cores.
     #   sweet (SM7150): 0-5 Cortex-A55 @1.8G, 6-7 Cortex-A76 @2.3G, one
     #   homogeneous cluster, reg = core << 8 (synthetic MPIDR with Aff1=core).
-    #   haydn (SM8350): 0-3 A78 gold, 4-7 A55 silver (two physical clusters!).
-    #   Real Qualcomm MPIDR layout = Aff1 encodes cluster, Aff0 encodes core
-    #   within cluster: gold 0x000..0x003, silver 0x100..0x103.
+    #   haydn (SM8350): cpu0-3 A55, cpu4-6 A78, cpu7 X1, but the MIUI
+    #   firmware reports every core as Aff1=<core>, Aff0=0 (flattened map).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
     if haydn:
-        haydn_regs = [0x000, 0x001, 0x002, 0x003,  # gold
-                      0x100, 0x101, 0x102, 0x103]  # silver
-        haydn_die_clusters = [0, 0, 0, 0, 1, 1, 1, 1]   # gold=0, silver=1
-        haydn_cluster_core_ids = [0, 1, 2, 3, 0, 1, 2, 3]  # Aff0 within cluster
+        # MIUI ABL hands out a FLATTENED MPIDR map: the core number lives in
+        # Aff1 and Aff0 is always 0 (PSCI AFFINITY_INFO answers only for
+        # 0x000/0x100/0x200/0x300; 0x001/0x101 come back -2). So CPU_ON and
+        # SGI targets must use core << 8, and every core is its own GIC
+        # "cluster" (Aff1) with Aff0 = 0.
+        haydn_regs = [core << 8 for core in range(8)]
+        haydn_die_clusters = list(range(8))
+        haydn_cluster_core_ids = [0] * 8
+        # SM8350: cpu0-3 = A55 (EPSS domain0, top 1.8048 GHz), cpu4-6 = A78
+        # (domain1, 2.4192), cpu7 = X1 (domain2, 2.8416).
+        haydn_freqs = ([1804800000] * 4 +   # A55
+                       [2419200000] * 3 +   # A78
+                       [2841600000])        # X1
         for core in range(8):
             cpu_nodes.append(node(f'cpu{core}', [
                 ph(),
@@ -170,7 +178,7 @@ def build(seed=None, qemu=False, highmem=False, haydn=False, add_fbcon=True):
                 ('l3-cache-id', u32(0)),     # shared L3
                 ('state', cstr('running' if core == 0 else 'stopped')),
                 ('timebase-frequency', u32(timebase)),
-                ('clock-frequency', u32(freq_of(core))),
+                ('clock-frequency', u32(haydn_freqs[core])),
                 ('bus-frequency', u32(100000000)),
                 ('memory-frequency', u32(1866000000)),
                 ('peripheral-frequency', u32(timebase)),
